@@ -1,0 +1,13 @@
+{
+  "_comment": "Human units: degrees, mm, kg, kg*cm. Pass with: python main.py --config config/calibration_example.json",
+  "joints": {
+    "joint_1": {"zero_offset": 0, "direction": 1, "min_angle": -90, "max_angle": 90, "home_position": 0},
+    "joint_2": {"direction": -1, "zero_offset": 0, "torque_limit_kgcm": 17},
+    "joint_3": {"max_velocity_deg_s": 90}
+  },
+  "links": {
+    "link2": {"length_mm": 110, "mass_kg": 0.15},
+    "link3": {"length_mm": 105, "mass_kg": 0.12}
+  },
+  "tcp_offset_mm": 90
+}
