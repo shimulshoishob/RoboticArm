@@ -1,43 +1,47 @@
 #!/usr/bin/env python3
-"""6-DOF robotic arm simulator driven by EMG gestures - everything in ONE file.
+"""6-DOF robotic arm simulator driven by EMG gestures (MuJoCo physics) - everything in ONE file.
 
 Just run it (no arguments needed):
 
     python robotic_arm.py
 
-That starts every component together:
+That opens one BioWave-style window with everything in it:
 
-    * PyBullet physics            (control process, 120 Hz, DIRECT client)
-    * 3D viewer window            (separate process, keyboard-driven)
-    * control loop thread         (planner + IK + servos + safety + collision veto + CSV log in ./logs)
-    * EMG input thread            (mock EMG source -> confidence gate -> smoothing -> MotionCommand)
-    * terminal telemetry dashboard
+    * 3D view of the arm          (MuJoCo, rendered off-screen into the window - no extra process, no mjpython)
+    * connect / model / calibrate (ESP32-S3 armband over Wi-Fi or USB, trained .joblib model, REST/FLEX)
+    * gesture -> arm-action mapping, live EMG plot, confidence, signal quality, arm telemetry
+    * E-STOP, home, gripper, jog pad, "test without device" gesture buttons
 
-Keys in the 3D window (click it first):
+and these threads: control loop (planner + IK + servos + safety + collision veto + CSV log in ./logs), EMG input
+(mock source), and the MuJoCo physics inside the control loop.
+
+    pip install numpy mujoco PyQt5 pyqtgraph pyserial joblib scikit-learn
+
+Keys (window focused, no text box selected):
     Q/A W/S E/D R/F T/G Y/H   jog joints J1..J6        arrows + I/K   jog the tool (X/Z, Y)
     1 left  2 right  3 up  4 down  5 fist(close)  0 rest      <- mock EMG gestures (hold the key)
     O open gripper   C close gripper   SPACE stop   Z home   X reset after a stop   ESC emergency stop
     P  pick-and-place demo
+3D view: drag = orbit, right-drag (or shift-drag) = pan, wheel = zoom, double-click = reset view.
 
 Other ways to run it:
 
-    python robotic_arm.py --emg scripted                       # scripted EMG gesture demo in the 3D view
+    python robotic_arm.py --model path/to/rf_realtime_model.joblib   # pre-load a trained model
+    python robotic_arm.py --emg scripted                       # scripted EMG gesture demo
     python robotic_arm.py --mode emg                           # only EMG drives the arm (no manual jogging)
-    python robotic_arm.py --panel                              # add PyBullet's slider/button sidebar (slow on M1)
     python robotic_arm.py --headless --emg noisy --fast --duration 12   # console-only, deterministic
-    python robotic_arm.py --control-hz 240                     # the original physics rate
-    python robotic_arm.py --export-urdf arm.urdf
+    python robotic_arm.py --export-urdf arm.urdf               # also: --export-mjcf arm.xml
 
 MacBook Air M1 notes (what was tuned, and why):
     * BLAS/OpenMP pinned to 1 thread (set before numpy loads): the maths is tiny, thread hand-offs only cost.
-    * Control/physics rate 240 -> 120 Hz and resting objects may sleep: ~2x less CPU / heat on a fanless Air.
+    * MuJoCo: ~4 physics sub-steps per 120 Hz control tick cost well under 1 ms; nothing sleeps or spins.
+    * Rendering is off-screen via CGL (MUJOCO_GL=cgl), capped to ~0.7 megapixel and --gui-fps (default 30);
+      frames are only drawn while the window is visible. Shadows/reflections can be switched off (--no-shadows).
     * Kinematics: cached forward kinematics, closed-form rotations, analytic pitch Jacobian (IK ~2x faster).
-    * Viewer: PyBullet's sidebar costs ~8 ms per widget per frame on the M1's OpenGL driver (21 widgets ->
-      5 fps), so the default view has no sidebar (-> ~30 fps); shadows are off; window sized for a 13" screen.
     * caffeinate keeps App Nap from throttling the real-time timers; warns if Python runs under Rosetta.
 
-Setup (Apple Silicon, NATIVE arm64 Python 3.10-3.13):   pip install numpy pybullet
-Without PyBullet the arm still runs headless on the pure-NumPy kinematic backend.
+Setup (Apple Silicon, NATIVE arm64 Python 3.10-3.13):   pip install numpy mujoco
+Without MuJoCo the arm still runs headless on the pure-NumPy kinematic backend (no 3D view).
 """
 from __future__ import annotations
 
@@ -57,17 +61,19 @@ _os.environ.setdefault("PYTHONUNBUFFERED", "1")
 import argparse
 import copy
 import csv
+import hashlib
+import hmac
 import itertools
 import json
 import logging
 import math
-import multiprocessing as mp
 import os
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -75,11 +81,53 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Any, Callable, Iterable, Optional, Tuple
+from urllib.parse import quote
 
 import numpy as np
 
 IS_MACOS = sys.platform == "darwin"
+
+# Optional dependencies. The simulator itself only needs numpy (+ mujoco for physics and the 3D view).
+if IS_MACOS:
+    os.environ.setdefault("MUJOCO_GL", "cgl")        # headless OpenGL on Apple Silicon: no GLFW window needed
+try:
+    import mujoco
+    HAS_MUJOCO = True
+except Exception:                                    # pragma: no cover
+    mujoco, HAS_MUJOCO = None, False
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_SERIAL = True
+except ImportError:
+    serial, HAS_SERIAL = None, False
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    joblib, HAS_JOBLIB = None, False
+
+# A missing PyQt5 / pyqtgraph only disables the dashboard; the simulator itself keeps working.
+HAS_QT = HAS_PYQTGRAPH = False
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
+os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
+try:
+    from PyQt5.QtCore import QEvent, QSettings, Qt, QThread, QTimer, pyqtSignal
+    from PyQt5.QtGui import QFont, QImage, QPixmap
+    from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+                                 QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                                 QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+                                 QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+    HAS_QT = True
+except ImportError:
+    pass
+if HAS_QT:
+    try:
+        import pyqtgraph as pg
+        HAS_PYQTGRAPH = True
+    except ImportError:
+        pass
 
 
 def running_under_rosetta() -> bool:
@@ -1948,25 +1996,25 @@ class CollisionChecker:
 # ====================================================================================================
 # PHYSICS BACKENDS (KINEMATIC / PYBULLET)   (from simulation/physics.py)
 # ====================================================================================================
+# ====================================================================================================
 # Physics backends. The controller talks only to ``PhysicsBackend``.
 #
 # * KinematicBackend - no dependencies; joints track their commands perfectly, no objects/contacts.
-# * PyBulletBackend  - gravity, collisions, joint motors with torque caps, friction grasping, GUI.
+# * MuJoCoBackend    - gravity, contacts, position actuators with torque caps, friction grasping.
 #
-# All PyBullet calls are serialised through ``backend.lock`` (control thread + UI thread share one client).
+# MuJoCo is a plain library (no GUI process, no OpenGL window): the dashboard renders the scene off-screen into
+# a Qt widget (see SceneRenderer / ViewWidget), so there is nothing to launch with `mjpython` and nothing that can
+# stall the control loop. All MuJoCo calls are serialised through ``backend.lock``.
 
-try:                                       # optional dependency
-    import pybullet as _p
-    import pybullet_data as _pd
-except Exception:                          # pragma: no cover
-    _p = _pd = None
+SUBSTEP_MAX_S = 0.0025          # physics sub-step upper bound; MuJoCo is so cheap here that 4 sub-steps per
+                                # 120 Hz control tick cost < 0.1 ms on an M1
+ARM_KP, ARM_KV = 60.0, 1.0      # position-actuator gains of the arm joints (N*m/rad, N*m*s/rad)
+FINGER_KP, FINGER_KV = 2000.0, 20.0
+JOINT_ARMATURE = 0.001          # servo gear-train inertia: keeps the stiff position loop well conditioned
 
 
-SOLVER_ITERATIONS = 80          # PyBullet constraint-solver iterations per step (cost is ~linear in this)
-
-
-def pybullet_available() -> bool:
-    return _p is not None
+def mujoco_available() -> bool:
+    return HAS_MUJOCO
 
 
 class PhysicsBackend(ABC):
@@ -1996,7 +2044,7 @@ class PhysicsBackend(ABC):
 
 
 class KinematicBackend(PhysicsBackend):
-    """Perfect tracking, no physics. Useful for tests and machines without PyBullet."""
+    """Perfect tracking, no physics. Useful for tests and machines without MuJoCo."""
 
     def __init__(self):
         self._q = np.zeros(5)
@@ -2019,213 +2067,321 @@ class KinematicBackend(PhysicsBackend):
         return None if self.env is None else self.env.get(name).position
 
 
-class _World:
-    """Handles of one PyBullet client."""
-
-    def __init__(self, client: int):
-        self.client = client
-        self.robot = None
-        self.table = None
-        self.objects: dict[str, int] = {}
-        self.joint_idx: dict[str, int] = {}
-        self.link_names: dict[int, str] = {-1: "base"}
-
-    @property
-    def arm_idx(self) -> list:
-        return [self.joint_idx[f"j{i}"] for i in range(1, 6)]
-
-    @property
-    def finger_idx(self) -> list:
-        return [self.joint_idx["j6_finger_l"], self.joint_idx["j6_finger_r"]]
+# ----------------------------------------------------------------------------------------------------
+# MJCF generation: the model comes from RobotConfig, so geometry/mass/limits live in ONE place.
+# Link frames follow robot/kinematics.py: link i's frame sits on joint i's axis and the link extends along
+# +Z by ``length`` to the next joint origin. Collision filtering: robot geoms never collide with each other
+# (like the old URDF without self-collision); they collide with the table, floor and objects.
+# ----------------------------------------------------------------------------------------------------
+def _v(vals) -> str:
+    return " ".join(f"{float(x):.6g}" for x in vals)
 
 
-def _add_object(p, w: _World, obj: SimObject) -> int:
-    c = w.client
-    if obj.kind == "cube":
-        h = obj.dims[0] / 2
-        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[h] * 3, physicsClientId=c)
-        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[h] * 3, rgbaColor=list(obj.color), physicsClientId=c)
-    elif obj.kind == "sphere":
-        col = p.createCollisionShape(p.GEOM_SPHERE, radius=obj.dims[0], physicsClientId=c)
-        vis = p.createVisualShape(p.GEOM_SPHERE, radius=obj.dims[0], rgbaColor=list(obj.color), physicsClientId=c)
-    else:
-        col = p.createCollisionShape(p.GEOM_CYLINDER, radius=obj.dims[0], height=obj.dims[1], physicsClientId=c)
-        vis = p.createVisualShape(p.GEOM_CYLINDER, radius=obj.dims[0], length=obj.dims[1],
-                                  rgbaColor=list(obj.color), physicsClientId=c)
-    bid = p.createMultiBody(obj.mass, col, vis, list(obj.position), physicsClientId=c)
-    p.changeDynamics(bid, -1, lateralFriction=1.0, spinningFriction=0.005, rollingFriction=0.001, physicsClientId=c)
-    # Let a resting object fall asleep (no solver work until the gripper touches it): ~20% less CPU per step.
-    p.changeDynamics(bid, -1, activationState=p.ACTIVATION_STATE_ENABLE_SLEEPING, physicsClientId=c)
-    w.objects[obj.name] = bid
-    return bid
+def _half(size) -> str:
+    return _v([s / 2 for s in size])
 
 
-def make_world(client: int, cfg: RobotConfig, env: Environment, dt: float, gui: bool = False,
-               show_frames: bool = True) -> _World:
-    """Scene (table + floor), robot from the generated URDF, and objects, inside one PyBullet client.
-    Used for the DIRECT physics client AND for the GUI viewer process (identical geometry)."""
-    p, c = _p, client
-    w = _World(client)
-    p.setAdditionalSearchPath(_pd.getDataPath(), physicsClientId=c)
-    p.setGravity(0, 0, -9.81, physicsClientId=c)
-    p.setTimeStep(dt, physicsClientId=c)
-    p.setPhysicsEngineParameter(numSolverIterations=SOLVER_ITERATIONS, physicsClientId=c)
-    if gui:
-        p.configureDebugVisualizer(p.COV_ENABLE_KEYBOARD_SHORTCUTS, 0, physicsClientId=c)   # keys are ours
-        # Shadow-map pass is the single most expensive thing the OpenGL viewer does on the M1's integrated GPU.
-        p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 0, physicsClientId=c)
-        for flag in (p.COV_ENABLE_RGB_BUFFER_PREVIEW, p.COV_ENABLE_DEPTH_BUFFER_PREVIEW,
-                     p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW):
-            p.configureDebugVisualizer(flag, 0, physicsClientId=c)
-        p.resetDebugVisualizerCamera(0.65, 35, -28, [0.0, 0.10, 0.10], physicsClientId=c)
+def _rgba(color) -> str:
+    return _v(color)
+
+
+def build_mjcf(cfg: RobotConfig, env: Environment | None = None, timestep: float = 1.0 / 480.0) -> str:
+    env = env or Environment()
+    L, g = cfg.links, cfg.gripper
     tx, ty = env.table_size
     th = env.table_thickness
-    col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[tx / 2, ty / 2, th / 2], physicsClientId=c)
-    vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[tx / 2, ty / 2, th / 2],
-                              rgbaColor=[0.55, 0.42, 0.30, 1], physicsClientId=c)
-    w.table = p.createMultiBody(0, col, vis, [0, ty / 2 - 0.2, -th / 2], physicsClientId=c)
-    p.changeDynamics(w.table, -1, lateralFriction=0.9, physicsClientId=c)
-    fcol = p.createCollisionShape(p.GEOM_BOX, halfExtents=[3, 3, 0.05], physicsClientId=c)
-    fvis = p.createVisualShape(p.GEOM_BOX, halfExtents=[3, 3, 0.05], rgbaColor=[0.85, 0.85, 0.87, 1], physicsClientId=c)
-    p.createMultiBody(0, fcol, fvis, [0, 0, -0.75], physicsClientId=c)
-    tmp = Path(tempfile.mkdtemp(prefix="arm_urdf_")) / "arm.urdf"
-    tmp.write_text(build_urdf(cfg, axes=gui and show_frames), encoding="utf-8")
-    w.robot = p.loadURDF(str(tmp), [0, 0, 0], useFixedBase=True, flags=p.URDF_USE_INERTIA_FROM_FILE,
-                         physicsClientId=c)
-    for i in range(p.getNumJoints(w.robot, physicsClientId=c)):
-        info = p.getJointInfo(w.robot, i, physicsClientId=c)
-        w.joint_idx[info[1].decode()] = i
-        w.link_names[i] = info[12].decode()
-    for obj in env.objects:
-        _add_object(p, w, obj)
-    return w
+    bw, bd = cfg.base_size
+
+    def inertial(link) -> str:
+        ixx, iyy, izz = link.inertia_diag()
+        return f'<inertial pos="{_v(link.com)}" mass="{link.mass:.6g}" diaginertia="{_v((ixx, iyy, izz))}"/>'
+
+    x = [f'<mujoco model="{cfg.name}">',
+         '<compiler angle="radian" autolimits="true"/>',
+         f'<option timestep="{timestep:.8g}" gravity="0 0 -9.81" integrator="implicitfast"/>',
+         '<visual><global offwidth="1920" offheight="1200"/><quality shadowsize="2048" offsamples="2"/>'
+         '<headlight ambient="0.42 0.42 0.45" diffuse="0.5 0.5 0.5" specular="0 0 0"/>'
+         '<map znear="0.01" zfar="20"/><rgba haze="0.07 0.14 0.25 1"/></visual>',
+         '<asset>'
+         '<texture type="skybox" builtin="gradient" rgb1="0.20 0.32 0.52" rgb2="0.05 0.09 0.16" width="512" height="512"/>'
+         '<texture name="grid" type="2d" builtin="checker" rgb1="0.16 0.22 0.32" rgb2="0.12 0.17 0.26" width="256" height="256" '
+         'mark="edge" markrgb="0.25 0.35 0.45"/>'
+         '<material name="floor" texture="grid" texrepeat="12 12" reflectance="0.12"/>'
+         '<material name="alu" rgba="0.78 0.80 0.83 1" specular="0.6" shininess="0.5"/>'
+         '<material name="dark" rgba="0.10 0.10 0.12 1"/>'
+         '<material name="finger" rgba="0.62 0.65 0.70 1" specular="0.4"/>'
+         '<material name="table" rgba="0.55 0.42 0.30 1" specular="0.1"/>'
+         '</asset>',
+         '<default>'
+         '<joint damping="0.02" frictionloss="0.01"/>'
+         f'<default class="robot"><geom contype="1" conaffinity="2" friction="0.8 0.01 0.001"/></default>'
+         '<default class="world"><geom contype="2" conaffinity="3"/></default>'
+         '<default class="visual"><geom contype="0" conaffinity="0" group="2"/></default>'
+         '</default>',
+         '<worldbody>',
+         '<light name="sun" pos="0.4 -0.6 1.4" dir="-0.25 0.45 -1" directional="true" diffuse="0.75 0.75 0.75" '
+         'specular="0.1 0.1 0.1" castshadow="true"/>',
+         f'<geom name="floor" class="world" type="plane" pos="0 0 -0.02" size="3 3 0.1" material="floor"/>',
+         f'<geom name="table" class="world" type="box" pos="0 {ty / 2 - 0.2:.6g} {-th / 2:.6g}" '
+         f'size="{_v((tx / 2, ty / 2, th / 2))}" material="table" friction="0.9 0.01 0.001"/>']
+
+    # ---- arm (nested bodies)
+    x.append(f'<body name="base" pos="0 0 0">'
+             f'<geom class="robot" type="box" pos="0 0 {L[0].length / 2:.6g}" size="{_half((bw, bd, L[0].length))}" material="alu"/>')
+    for i in range(1, 6):
+        link, parent = L[i], L[i - 1]
+        j = cfg.joints[i - 1]
+        lw, ld = link.size
+        x.append(f'<body name="{link.name}" pos="0 0 {parent.length:.6g}">{inertial(link)}'
+                 f'<joint name="j{i}" type="hinge" axis="{_v(j.axis)}" range="{j.limit.min_angle:.6g} {j.limit.max_angle:.6g}" '
+                 f'armature="{JOINT_ARMATURE}"/>')
+        if i == 5:
+            x.append(f'<geom class="robot" type="box" pos="0 0 {g.palm_length / 2:.6g}" '
+                     f'size="{_half((lw, ld, g.palm_length))}" material="alu"/>')
+        else:
+            x.append(f'<geom class="visual" type="box" pos="0 0 {link.length - 0.018:.6g}" '
+                     f'size="{_half((lw * 1.15, ld * 1.5, 0.036))}" material="dark"/>')
+            x.append(f'<geom class="robot" type="box" pos="0 0 {link.length / 2:.6g}" '
+                     f'size="{_half((lw, ld, link.length))}" material="alu"/>')
+    # ---- gripper fingers + TCP, children of the end-effector body
+    fx = g.finger_thickness / 2
+    for side, sgn in (("l", 1), ("r", -1)):
+        m = g.finger_mass
+        ix = m / 12 * (g.finger_depth ** 2 + g.finger_length ** 2)
+        iy = m / 12 * (g.finger_thickness ** 2 + g.finger_length ** 2)
+        iz = m / 12 * (g.finger_thickness ** 2 + g.finger_depth ** 2)
+        x.append(f'<body name="finger_{side}" pos="{sgn * fx:.6g} 0 {g.palm_length:.6g}">'
+                 f'<inertial pos="0 0 {g.finger_length / 2:.6g}" mass="{m}" diaginertia="{_v((ix, iy, iz))}"/>'
+                 f'<joint name="j6_finger_{side}" type="slide" axis="{sgn} 0 0" range="0 {g.finger_travel:.6g}" '
+                 f'armature="0.0002" damping="0.5"/>'
+                 f'<geom class="robot" type="box" pos="0 0 {g.finger_length / 2:.6g}" '
+                 f'size="{_half((g.finger_thickness, g.finger_depth, g.finger_length))}" material="finger" '
+                 f'friction="1.4 0.02 0.002"/></body>')
+    x.append(f'<site name="tcp" pos="0 0 {cfg.tcp_offset:.6g}" size="0.006" rgba="1 0.25 0.25 0.9"/>')
+    x.append("</body>" * 5 + "</body>")             # close link5(ee) ... link1 (5 links) and base
+
+    # ---- objects (free bodies)
+    for o in env.objects:
+        if o.kind == "cube":
+            shape = f'type="box" size="{_v([o.dims[0] / 2] * 3)}"'
+        elif o.kind == "sphere":
+            shape = f'type="sphere" size="{o.dims[0]:.6g}"'
+        else:
+            shape = f'type="cylinder" size="{o.dims[0]:.6g} {o.dims[1] / 2:.6g}"'
+        x.append(f'<body name="{o.name}" pos="{_v(o.position)}"><freejoint name="{o.name}_free"/>'
+                 f'<geom class="world" {shape} mass="{o.mass:.6g}" rgba="{_rgba(o.color)}" '
+                 f'friction="1.0 0.005 0.001" condim="4"/></body>')
+    x.append('</worldbody>')
+    x.append('<contact><exclude body1="finger_l" body2="finger_r"/></contact>')
+    # ---- actuators: position servos with torque caps
+    x.append('<actuator>')
+    for i in range(1, 6):
+        t = cfg.joints[i - 1].servo.torque_limit
+        x.append(f'<position name="a{i}" joint="j{i}" kp="{ARM_KP}" kv="{ARM_KV}" forcerange="{-t:.6g} {t:.6g}" '
+                 f'ctrlrange="{cfg.joints[i - 1].limit.min_angle:.6g} {cfg.joints[i - 1].limit.max_angle:.6g}"/>')
+    for side in ("l", "r"):
+        x.append(f'<position name="a6{side}" joint="j6_finger_{side}" kp="{FINGER_KP}" kv="{FINGER_KV}" '
+                 f'forcerange="{-g.max_grip_force} {g.max_grip_force}" ctrlrange="0 {g.finger_travel:.6g}"/>')
+    x.append('</actuator></mujoco>')
+    return "\n".join(x)
 
 
-class PyBulletBackend(PhysicsBackend):
-    """Physics in a fast DIRECT client. Rendering is a separate concern: the GUI lives in its own process
-    (ui/gui.py) and is fed ``view_state()``; any call into PyBullet's GUI client can block ~100+ ms."""
+def export_mjcf(cfg: RobotConfig, path: str | Path, env: Environment | None = None) -> Path:
+    path = Path(path)
+    path.write_text(build_mjcf(cfg, env), encoding="utf-8")
+    return path
 
+
+class MuJoCoBackend(PhysicsBackend):
     supports_physics = True
 
-    def __init__(self, config: RobotConfig, dt: float = 1.0 / 240.0, position_gain: float = 0.5,
-                 velocity_gain: float = 1.0):
-        if _p is None:
-            raise RuntimeError("pybullet is not installed (pip install pybullet)")
+    def __init__(self, config: RobotConfig, dt: float = 1.0 / 120.0):
+        if not HAS_MUJOCO:
+            raise RuntimeError("mujoco is not installed (pip install mujoco)")
         self.cfg = config
-        self.dt = dt
-        self.kp, self.kd = position_gain, velocity_gain
-        self.p = _p
+        self.dt = dt                                    # one control tick
+        self.substeps = max(1, math.ceil(dt / SUBSTEP_MAX_S - 1e-9))
         self.lock = threading.RLock()
-        self.phys: _World | None = None
+        self.model = None
+        self.data = None
         self.objects: dict[str, SimObject] = {}
 
-    @property
-    def client(self):
-        return self.phys.client if self.phys else None
-
+    # ------------------------------------------------------------------ lifecycle
     def connect(self, env: Environment | None = None) -> None:
-        p = self.p
         env = env or Environment()
+        mj = mujoco
         with self.lock:
-            self.phys = make_world(p.connect(p.DIRECT), self.cfg, env, self.dt)
-            for o in env.objects:
-                self.objects[o.name] = o
-                o.body_id = self.phys.objects[o.name]
-            w, c = self.phys, self.phys.client
-            self._torque = [self.cfg.joints[i].servo.torque_limit for i in range(5)]
-            p.setCollisionFilterPair(w.robot, w.robot, *w.finger_idx, 0, physicsClientId=c)
-            for fi in w.finger_idx:
-                p.changeDynamics(w.robot, fi, lateralFriction=1.2, spinningFriction=0.01, physicsClientId=c)
-            for ji in w.arm_idx:                         # pure position control: disable default velocity motor
-                p.setJointMotorControl2(w.robot, ji, p.VELOCITY_CONTROL, force=0, physicsClientId=c)
+            self.model = mj.MjModel.from_xml_string(build_mjcf(self.cfg, env, self.dt / self.substeps))
+            self.data = mj.MjData(self.model)
+            m = self.model
+            jid = lambda n: mj.mj_name2id(m, mj.mjtObj.mjOBJ_JOINT, n)
+            self._arm_qadr = [int(m.jnt_qposadr[jid(f"j{i}")]) for i in range(1, 6)]
+            self._fing_qadr = [int(m.jnt_qposadr[jid(f"j6_finger_{s}")]) for s in ("l", "r")]
+            self._tcp_site = mj.mj_name2id(m, mj.mjtObj.mjOBJ_SITE, "tcp")
+            self._body_id = {o.name: mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, o.name) for o in env.objects}
+            self._body_name = {i: (mj.mj_id2name(m, mj.mjtObj.mjOBJ_BODY, i) or "world") for i in range(m.nbody)}
+            self._table_geom = mj.mj_name2id(m, mj.mjtObj.mjOBJ_GEOM, "table")
+            self.objects = {o.name: o for o in env.objects}
+            self._finger_bodies = {mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, f"finger_{s}") for s in ("l", "r")}
+            self._obj_bodies = set(self._body_id.values())
+            self._base_body = mj.mj_name2id(m, mj.mjtObj.mjOBJ_BODY, "base")
             self.reset_state(np.array(self.cfg.home_angles[:5]), 1.0)
-
-    # ------------------------------------------------------------------ objects
-    def add_object(self, obj: SimObject) -> int:
-        with self.lock:
-            self.objects[obj.name] = obj
-            obj.body_id = _add_object(self.p, self.phys, obj)
-            return obj.body_id
-
-    def object_position(self, name: str):
-        with self.lock:
-            pos, _ = self.p.getBasePositionAndOrientation(self.phys.objects[name], physicsClientId=self.client)
-        return tuple(pos)
-
-    def reset_object(self, name: str, position) -> None:
-        with self.lock:
-            bid = self.phys.objects[name]
-            self.p.resetBasePositionAndOrientation(bid, list(position), [0, 0, 0, 1], physicsClientId=self.client)
-            self.p.resetBaseVelocity(bid, [0, 0, 0], [0, 0, 0], physicsClientId=self.client)
-
-    # ------------------------------------------------------------------ control / stepping
-    def reset_state(self, q5, opening: float) -> None:
-        p, c, w = self.p, self.client, self.phys
-        with self.lock:
-            for ji, q in zip(w.arm_idx, q5):
-                p.resetJointState(w.robot, ji, float(q), physicsClientId=c)
-            s = opening * self.cfg.gripper.finger_travel
-            for fi in w.finger_idx:
-                p.resetJointState(w.robot, fi, s, physicsClientId=c)
-
-    def set_targets(self, q5, opening: float) -> None:
-        p, c, w = self.p, self.client, self.phys
-        with self.lock:
-            p.setJointMotorControlArray(
-                w.robot, w.arm_idx, p.POSITION_CONTROL, targetPositions=[float(v) for v in q5],
-                forces=self._torque, positionGains=[self.kp] * 5, velocityGains=[self.kd] * 5, physicsClientId=c)
-            s = float(np.clip(opening, 0, 1)) * self.cfg.gripper.finger_travel
-            p.setJointMotorControlArray(
-                w.robot, w.finger_idx, p.POSITION_CONTROL, targetPositions=[s, s],
-                forces=[self.cfg.gripper.max_grip_force] * 2, physicsClientId=c)
-
-    def step(self) -> None:
-        with self.lock:
-            self.p.stepSimulation(physicsClientId=self.client)
-
-    def read_state(self):
-        p, c, w = self.p, self.client, self.phys
-        with self.lock:
-            st = p.getJointStates(w.robot, w.arm_idx, physicsClientId=c)
-            fs = p.getJointStates(w.robot, w.finger_idx, physicsClientId=c)
-        q = np.array([s[0] for s in st])
-        travel = float(np.mean([s[0] for s in fs]))
-        return q, travel / self.cfg.gripper.finger_travel
-
-    def view_state(self) -> dict:
-        """Everything a viewer needs to pose its copy of the scene (picklable)."""
-        p, c, w = self.p, self.client, self.phys
-        with self.lock:
-            idx = w.arm_idx + w.finger_idx
-            joints = [s[0] for s in p.getJointStates(w.robot, idx, physicsClientId=c)]
-            objs = {n: p.getBasePositionAndOrientation(b, physicsClientId=c) for n, b in w.objects.items()}
-        return {"joints": joints, "objects": objs}
-
-    def get_contacts(self) -> list:
-        """Unwanted contacts: robot vs table/objects, excluding base-table and finger-object (grasp)."""
-        p, c, w = self.p, self.client, self.phys
-        found = []
-        with self.lock:
-            pts = p.getContactPoints(bodyA=w.robot, physicsClientId=c)
-        finger_links = set(w.finger_idx)
-        obj_ids = {bid: n for n, bid in w.objects.items()}
-        for cp in pts:
-            link, other = cp[3], cp[2]
-            if other == w.robot:
-                continue
-            if link == -1 and other == w.table:
-                continue
-            if link in finger_links and other in obj_ids:
-                continue
-            tag = "table" if other == w.table else obj_ids.get(other, f"body{other}")
-            found.append(f"{w.link_names.get(link, link)}-{tag}")
-        return sorted(set(found))
 
     def disconnect(self) -> None:
         with self.lock:
-            if self.phys is not None and self.p.isConnected(self.phys.client):
-                self.p.disconnect(self.phys.client)
-            self.phys = None
+            self.model = self.data = None
+
+    # ------------------------------------------------------------------ objects
+    def object_position(self, name: str):
+        with self.lock:
+            return tuple(float(v) for v in self.data.xpos[self._body_id[name]])
+
+    def reset_object(self, name: str, position) -> None:
+        with self.lock:
+            m, d = self.model, self.data
+            j = int(m.body_jntadr[self._body_id[name]])
+            qa, va = int(m.jnt_qposadr[j]), int(m.jnt_dofadr[j])
+            d.qpos[qa:qa + 3] = position
+            d.qpos[qa + 3:qa + 7] = (1, 0, 0, 0)
+            d.qvel[va:va + 6] = 0
+            mujoco.mj_forward(m, d)
+
+    # ------------------------------------------------------------------ control / stepping
+    def reset_state(self, q5, opening: float) -> None:
+        with self.lock:
+            d = self.data
+            for a, q in zip(self._arm_qadr, q5):
+                d.qpos[a] = float(q)
+            s = float(np.clip(opening, 0, 1)) * self.cfg.gripper.finger_travel
+            for a in self._fing_qadr:
+                d.qpos[a] = s
+            d.qvel[:] = 0
+            self._write_ctrl(q5, opening)
+            mujoco.mj_forward(self.model, d)
+
+    def _write_ctrl(self, q5, opening: float) -> None:
+        d = self.data
+        d.ctrl[:5] = np.asarray(q5, float)[:5]
+        d.ctrl[5:7] = float(np.clip(opening, 0, 1)) * self.cfg.gripper.finger_travel
+
+    def set_targets(self, q5, opening: float) -> None:
+        with self.lock:
+            self._write_ctrl(q5, opening)
+
+    def step(self) -> None:
+        with self.lock:
+            mujoco.mj_step(self.model, self.data, nstep=self.substeps)
+
+    def read_state(self):
+        with self.lock:
+            q = self.data.qpos[self._arm_qadr].copy()
+            travel = float(np.mean(self.data.qpos[self._fing_qadr]))
+        return q, travel / self.cfg.gripper.finger_travel
+
+    def tcp_position(self) -> np.ndarray:
+        with self.lock:
+            return self.data.site_xpos[self._tcp_site].copy()
+
+    def view_qpos(self) -> np.ndarray:
+        """Snapshot of the generalized positions: all a renderer needs to pose its own copy of the scene."""
+        with self.lock:
+            return self.data.qpos.copy()
+
+    def get_contacts(self) -> list:
+        """Unwanted contacts: robot vs table/floor/objects, excluding base-table and finger-object (grasp)."""
+        found = set()
+        with self.lock:
+            m, d = self.model, self.data
+            for k in range(d.ncon):
+                c = d.contact[k]
+                if c.dist > 0:
+                    continue
+                b1, b2 = int(m.geom_bodyid[c.geom1]), int(m.geom_bodyid[c.geom2])
+                g1, g2 = int(c.geom1), int(c.geom2)
+                for link, other, og in ((b1, b2, g2), (b2, b1, g1)):
+                    if link not in self._link_bodies or other in self._link_bodies:
+                        continue
+                    if link == self._base_body and og == self._table_geom:
+                        continue
+                    if link in self._finger_bodies and other in self._obj_bodies:
+                        continue
+                    tag = "table" if og == self._table_geom else "floor" if other == 0 else self._body_name[other]
+                    found.add(f"{self._body_name[link]}-{tag}")
+        return sorted(found)
+
+    @property
+    def _link_bodies(self) -> set:
+        if not hasattr(self, "_link_set"):
+            self._link_set = {i for i, n in self._body_name.items()
+                              if n in {l.name for l in self.cfg.links} | {"finger_l", "finger_r"}}
+        return self._link_set
+
+
+# ----------------------------------------------------------------------------------------------------
+# Off-screen scene renderer (Qt-free). Poses its OWN MjData from ``backend.view_qpos()``, so rendering never
+# touches the physics state and can never stall the control loop. ``MUJOCO_GL=cgl`` (set on macOS at import)
+# gives a headless OpenGL context on Apple Silicon: no GLFW window, no mjpython.
+# ----------------------------------------------------------------------------------------------------
+class SceneRenderer:
+    def __init__(self, backend: "MuJoCoBackend", width: int = 960, height: int = 600, shadows: bool = True):
+        self.backend = backend
+        self.model = backend.model
+        self.data = mujoco.MjData(self.model)
+        self.size = (int(width), int(height))
+        self.renderer = mujoco.Renderer(self.model, self.size[1], self.size[0])
+        self.cam = mujoco.MjvCamera()
+        self.opt = mujoco.MjvOption()
+        self.shadows = shadows
+        self.model.vis.scale.framelength = 0.35
+        self.model.vis.scale.framewidth = 0.04
+        self.reset_view()
+
+    def reset_view(self) -> None:
+        c = self.cam
+        c.type = mujoco.mjtCamera.mjCAMERA_FREE
+        c.lookat[:] = (0.0, 0.14, 0.09)
+        c.distance, c.azimuth, c.elevation = 0.95, -128.0, -24.0
+
+    def set_frames(self, on: bool) -> None:
+        self.opt.frame = mujoco.mjtFrame.mjFRAME_BODY if on else mujoco.mjtFrame.mjFRAME_NONE
+
+    def resize(self, width: int, height: int) -> None:
+        if (int(width), int(height)) == self.size:
+            return
+        self.renderer.close()
+        self.size = (int(width), int(height))
+        self.renderer = mujoco.Renderer(self.model, self.size[1], self.size[0])
+
+    def render(self) -> np.ndarray:
+        self.data.qpos[:] = self.backend.view_qpos()
+        mujoco.mj_kinematics(self.model, self.data)
+        self.renderer.update_scene(self.data, camera=self.cam, scene_option=self.opt)
+        self.renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = int(self.shadows)
+        self.renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = int(self.shadows)
+        return self.renderer.render()
+
+    # ---- camera interaction (pixels in, camera out)
+    def orbit(self, dx: float, dy: float) -> None:
+        self.cam.azimuth -= dx * 0.4
+        self.cam.elevation = float(np.clip(self.cam.elevation - dy * 0.4, -89.0, 5.0))
+
+    def pan(self, dx: float, dy: float) -> None:
+        az, el = math.radians(self.cam.azimuth), math.radians(self.cam.elevation)
+        fwd = np.array([math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
+        right = np.cross(fwd, [0, 0, 1.0])
+        right /= max(np.linalg.norm(right), 1e-9)
+        up = np.cross(right, fwd)
+        k = self.cam.distance * 0.0016
+        self.cam.lookat[:] = np.clip(self.cam.lookat - right * dx * k + up * dy * k, -1.0, 1.0)
+
+    def zoom(self, steps: float) -> None:
+        self.cam.distance = float(np.clip(self.cam.distance * (0.9 ** steps), 0.25, 3.0))
+
+    def close(self) -> None:
+        try:
+            self.renderer.close()
+        except Exception:
+            pass
 
 
 # ====================================================================================================
@@ -3018,7 +3174,7 @@ def demo_script() -> list:
 # ====================================================================================================
 # UI: KEYBOARD CONTROLLER   (from ui/controls.py)
 # ====================================================================================================
-# Input handling that does not depend on PyBullet: key map + KeyboardController.
+# Input handling that does not depend on any GUI: key map + KeyboardController.
 #
 # The GUI feeds in the set of currently held key NAMES (and the edge-triggered ones);
 # this module turns them into MotionCommands. Only ONE motion key is honoured at a time
@@ -3033,7 +3189,7 @@ JOINT_KEYS = {
 CARTESIAN_KEYS = {"left": "LEFT", "right": "RIGHT", "up": "UP", "down": "DOWN", "i": "FORWARD", "k": "BACKWARD"}
 
 KEY_HELP = """\
-KEYBOARD (full / manual mode)
+KEYBOARD (dashboard window focused; full / manual mode)
   Q/A J1 base   W/S J2 shoulder   E/D J3 elbow   R/F J4 wrist pitch   T/G J5 wrist roll   Y/H gripper open/close
   Arrows: end effector LEFT(-X) RIGHT(+X) UP(+Z) DOWN(-Z)     I/K: forward/back (+Y/-Y)
   O open gripper   C close gripper   SPACE stop   Z home   X reset (re-arm after stop)   ESC emergency stop
@@ -3098,217 +3254,8 @@ class KeyboardController:
 
 
 # ====================================================================================================
-# UI: PYBULLET GUI VIEWER (SEPARATE PROCESS)   (from ui/gui.py)
+# TERMINAL TELEMETRY   (console runs: --no-dashboard / --headless)
 # ====================================================================================================
-# PyBullet GUI viewer. Runs in its OWN PROCESS (see ui/viewer_link.py).
-#
-# Why a separate process: any call into PyBullet's GUI client can block 100+ ms when the window is idle,
-# and on macOS the GUI must own a main thread. Keeping it away from the control process means the 240 Hz
-# control/physics loop can never be stalled by rendering or window events.
-#
-# Parent -> viewer : ("state", {"joints", "objects", "telemetry"})  /  ("quit",)
-# Viewer -> parent : ("cmd", MotionCommand) / ("gesture", name | None) / ("demo",) / ("closed",)
-#
-# Window layout (PyBullet's own): sidebar = joint + Cartesian sliders and buttons, centre = 3D scene
-# (frames drawn on every link, TCP frame longer) with one status line; full telemetry is shown by the parent
-# in the terminal.
-
-class _RemoteGestureKeys:
-    """Stands in for KeyboardEMGSource inside the viewer: forwards mock-EMG key state to the parent."""
-
-    def __init__(self, send):
-        self.send = send
-        self._cur = None
-
-    def set_gesture(self, g):
-        if g != self._cur:
-            self._cur = g
-            self.send(("gesture", g))
-
-    def release(self):
-        self.set_gesture(None)
-
-
-class PyBulletGUI:
-    def __init__(self, cfg, env, conn, mode: str = "manual", show_frames: bool = True, dt: float = 1 / 240,
-                 panel: bool = False):
-        import pybullet as p
-        self.p, self.cfg, self.conn, self.mode = p, cfg, conn, mode
-        self.panel = panel
-        self.client = p.connect(p.GUI, options="--width=1280 --height=760")
-        self.world = make_world(self.client, cfg, env, dt, gui=True, show_frames=show_frames)
-        self.kb = KeyboardController(self._send_cmd, mode,
-                                     _RemoteGestureKeys(self.conn.send) if mode in ("emg", "full") else None,
-                                     demo=lambda: self.conn.send(("demo",)))
-        self.fps = 0.0
-        self.running = True
-        self._slider_last, self._button_last = {}, {}
-        self._text_id, self._last_status = None, None
-        self.telemetry = None
-        self.joint_params, self.cart_params, self.buttons = [], {}, {}
-        if panel:
-            self._build_widgets()
-        else:
-            # PyBullet's sidebar is redrawn on EVERY render and costs ~8 ms per widget on the M1's OpenGL
-            # driver (measured: 21 widgets -> ~160 ms/frame = 5 fps; no panel -> ~3 ms/frame). The lean view
-            # keeps the 3D window smooth; every action has a key (see KEY_HELP). --panel brings the sliders back.
-            self.p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.client)
-
-    def _send_cmd(self, cmd: MotionCommand) -> bool:
-        self.conn.send(("cmd", cmd))
-        return True
-
-    # ------------------------------------------------------------------ widgets
-    def _build_widgets(self) -> None:
-        p, cl, cfg = self.p, self.client, self.cfg
-        for j in cfg.joints:
-            lo, hi = math.degrees(j.limit.min_angle), math.degrees(j.limit.max_angle)
-            pid = p.addUserDebugParameter(f"J{j.joint_id} {j.role} (deg)", lo, hi, math.degrees(j.home), physicsClientId=cl)
-            self.joint_params.append(pid)
-            self._slider_last[pid] = math.degrees(j.home)
-        for name, lo, hi, val in (("X (mm)", -300, 300, 0.0), ("Y (mm)", -300, 320, 136.0), ("Z (mm)", 0, 420, 64.0),
-                                  ("Roll (deg)", -180, 180, 180.0), ("Pitch (deg)", -90, 90, 0.0),
-                                  ("Yaw (deg)", -180, 180, 0.0)):
-            self.cart_params[name] = p.addUserDebugParameter("Cartesian " + name, lo, hi, val, physicsClientId=cl)
-        for name in ("GO to XYZ (tool down)", "GO to full pose (X,Y,Z,R,P,Y)", "HOME", "RESET", "STOP",
-                     "OPEN GRIPPER", "CLOSE GRIPPER", "PICK & PLACE DEMO", "E-STOP"):
-            pid = p.addUserDebugParameter(name, 1, 0, 0, physicsClientId=cl)      # rangeMin > rangeMax => button
-            self.buttons[name] = pid
-            self._button_last[pid] = 0
-
-    def _poll_widgets(self) -> None:
-        if not self.panel:
-            return
-        p, cl, send = self.p, self.client, self._send_cmd
-        rd = lambda pid: p.readUserDebugParameter(pid, physicsClientId=cl)
-        if self.mode in ("manual", "full"):
-            for i, pid in enumerate(self.joint_params):
-                v = rd(pid)
-                if abs(v - self._slider_last[pid]) > 1e-6:
-                    self._slider_last[pid] = v
-                    send(MotionCommand.joint_target(math.radians(v), joint=i + 1, source="slider"))
-        pressed = set()
-        for n, pid in self.buttons.items():
-            v = rd(pid)
-            if v != self._button_last[pid]:
-                self._button_last[pid] = v
-                pressed.add(n)
-        if "E-STOP" in pressed:
-            send(MotionCommand(ESTOP, source="button"))
-        if "RESET" in pressed:
-            send(MotionCommand(RESET, source="button"))
-        if "STOP" in pressed:
-            send(MotionCommand.stop(source="button"))
-        if "HOME" in pressed:
-            send(MotionCommand.home(source="button"))
-        if "OPEN GRIPPER" in pressed:
-            send(MotionCommand.gripper("OPEN", source="button"))
-        if "CLOSE GRIPPER" in pressed:
-            send(MotionCommand.gripper("CLOSE", source="button"))
-        if "PICK & PLACE DEMO" in pressed:
-            self.conn.send(("demo",))
-        if pressed & {"GO to XYZ (tool down)", "GO to full pose (X,Y,Z,R,P,Y)"}:
-            c = {n: rd(pid) for n, pid in self.cart_params.items()}
-            pos = (c["X (mm)"] / 1000, c["Y (mm)"] / 1000, c["Z (mm)"] / 1000)
-            if "GO to XYZ (tool down)" in pressed:
-                send(MotionCommand.move_to(pos, tool_pitch=math.pi, source="slider"))
-            else:
-                rpy = tuple(math.radians(c[k]) for k in ("Roll (deg)", "Pitch (deg)", "Yaw (deg)"))
-                send(MotionCommand.move_to(pos, orientation=rpy, source="slider"))
-
-    # ------------------------------------------------------------------ keyboard
-    def _key_name(self, key: int):
-        p = self.p
-        special = {p.B3G_LEFT_ARROW: "left", p.B3G_RIGHT_ARROW: "right", p.B3G_UP_ARROW: "up",
-                   p.B3G_DOWN_ARROW: "down", 27: "esc"}
-        if key in special:
-            return special[key]
-        return chr(key).lower() if 32 <= key < 127 else None
-
-    def _poll_keys(self) -> None:
-        p = self.p
-        held, trig = set(), set()
-        for key, st in p.getKeyboardEvents(physicsClientId=self.client).items():
-            name = self._key_name(key)
-            if name is None:
-                continue
-            if st & p.KEY_IS_DOWN:
-                held.add(name)
-            if st & p.KEY_WAS_TRIGGERED:
-                trig.add(name)
-        self.kb.update(held, trig)
-
-    # ------------------------------------------------------------------ state from the control process
-    def _apply_state(self, st: dict) -> None:
-        p, cl, w = self.p, self.client, self.world
-        for ji, pos in zip(w.arm_idx + w.finger_idx, st["joints"]):
-            p.resetJointState(w.robot, ji, pos, physicsClientId=cl)
-        for name, (pos, orn) in st["objects"].items():
-            p.resetBasePositionAndOrientation(w.objects[name], pos, orn, physicsClientId=cl)
-        self.telemetry = st["telemetry"]
-
-    def _draw_status(self) -> None:
-        """ONE in-scene text line, rewritten only when it changes (debug text costs ~75 ms/update)."""
-        s = self.telemetry
-        if s is None:
-            return
-        conf = "-" if s.confidence is None else f"{s.confidence*100:.0f}%"
-        status = f"{s.gesture} {conf} | {s.command} | " + ("ESTOP" if s.estopped else "SAFETY " + s.safety.level.name)
-        if status == self._last_status:
-            return
-        color = (1, 0.3, 0.3) if (s.estopped or s.safety.level >= 2) else (1, 0.6, 0.1) if not s.safety.ok else (0.1, 0.5, 0.1)
-        kw = dict(textColorRGB=list(color), textSize=1.3, physicsClientId=self.client)
-        if self._text_id is not None:
-            kw["replaceItemUniqueId"] = self._text_id
-        self._text_id = self.p.addUserDebugText(status, [-0.05, 0.0, 0.50], **kw)
-        self._last_status = status
-
-    # ------------------------------------------------------------------ main loop (viewer process main thread)
-    def run(self, target_fps: float = 30.0) -> None:
-        period = 1.0 / target_fps
-        last = time.perf_counter()
-        try:
-            while self.running and self.p.isConnected(self.client):
-                latest = None
-                while self.conn.poll():
-                    msg = self.conn.recv()
-                    if msg[0] == "quit":
-                        return
-                    if msg[0] == "state":
-                        latest = msg[1]
-                if latest is not None:
-                    self._apply_state(latest)            # pose update first: it also wakes the GUI's render loop
-                self._poll_keys()
-                self._poll_widgets()
-                self._draw_status()
-                now = time.perf_counter()
-                self.fps = 0.9 * self.fps + 0.1 / max(now - last, 1e-6)
-                last = now
-                time.sleep(max(0.0, period - 0.002 - (time.perf_counter() - now)))
-        except self.p.error:                             # window closed
-            pass
-        finally:
-            try:
-                self.conn.send(("closed",))
-            except Exception:
-                pass
-
-
-def viewer_main(conn, cfg, env, mode, show_frames, dt, fps: float = 30.0, panel: bool = False) -> None:
-    """Entry point of the viewer process."""
-    gui = PyBulletGUI(cfg, env, conn, mode, show_frames, dt, panel)
-    gui.run(fps)
-
-
-# ====================================================================================================
-# UI: VIEWER LINK & TERMINAL DASHBOARD   (from ui/viewer_link.py)
-# ====================================================================================================
-# Parent-process side of the GUI: spawns the viewer process and bridges it to the controller.
-#
-#     publisher thread (30 Hz):  backend.view_state() + controller.snapshot()  --pipe-->  viewer
-#                                viewer --pipe--> ("cmd", MotionCommand) -> controller.submit
-#                                                 ("gesture", g)         -> KeyboardEMGSource
-# Also prints a live telemetry dashboard in the terminal (when stdout is a TTY).
 
 def telemetry_lines(s, mode: str) -> list:
     j = "  ".join(f"J{i+1}:{math.degrees(a):7.1f} deg" for i, a in enumerate(s.joint_angles))
@@ -3324,107 +3271,1186 @@ def telemetry_lines(s, mode: str) -> list:
     ]
 
 
-class ViewerLink:
-    def __init__(self, cfg, env, backend, controller, mode: str = "manual", show_frames: bool = True,
-                 gesture_source=None, dashboard: bool = True, rate_hz: float = 30.0, on_demo=None,
-                 gui_fps: float = 30.0, panel: bool = False):
-        self.cfg, self.env, self.backend, self.ctl = cfg, env, backend, controller
-        self.panel = panel
-        self.on_demo = on_demo
-        self.gui_fps = gui_fps
-        self.mode, self.show_frames = mode, show_frames
-        self.gesture_source = gesture_source
-        self.dashboard = dashboard and sys.stdout.isatty()
-        self.period = 1.0 / rate_hz
-        self.closed = threading.Event()
-        self._proc = None
-        self._conn = None
-        self._thread = None
-        self._stop = threading.Event()
-        self._dash_drawn = False
+# ====================================================================================================
+# BIOWAVE EMG DEVICE LAYER   (from BioWaveEMG_ArmBand: rf_features, emg_v4_core, realtime_pipeline, mouse_controller)
+# ====================================================================================================
+# Feature extraction, calibration, signal-quality gating, decision engine, ring buffer and the ESP32-S3 wireless / USB
+# protocol, copied verbatim so live inference here matches the trainer in BioWave exactly.
 
-    def start(self) -> None:
-        ctx = mp.get_context("spawn")                 # fresh process: owns its own main thread for the GUI
-        self._conn, child = ctx.Pipe(duplex=True)
-        self._proc = ctx.Process(target=viewer_main, name="viewer",
-                                 args=(child, self.cfg, self.env, self.mode, self.show_frames, self.backend.dt, self.gui_fps, self.panel),
-                                 daemon=True)
-        self._proc.start()
-        self._thread = threading.Thread(target=self._loop, name="viewer-link", daemon=True)
-        self._thread.start()
+FEATURE_SCHEMA_VERSION = "emg-rf-15+rms-ratio+corr.v1"
 
-    def stop(self) -> None:
-        self._stop.set()
+
+FFT_MIN_HZ = 20.0
+
+
+FFT_MAX_HZ = 220.0
+
+
+BANDS = [(20.0, 60.0), (60.0, 120.0), (120.0, 220.0)]
+
+
+def _ensure_window_shape(window):
+    arr = np.asarray(window, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError("window must be 2D")
+    # Prefer (samples, channels). If likely transposed, flip.
+    if arr.shape[0] < arr.shape[1]:
+        arr = arr.T
+    if arr.shape[1] <= 0:
+        raise ValueError("window must have at least 1 channel")
+    return arr
+
+
+def _spectral_1d(x, sample_rate):
+    x = np.asarray(x, dtype=np.float32)
+    n = x.shape[0]
+    if n < 8:
+        return {
+            "mean_hz": 0.0,
+            "median_hz": 0.0,
+            "peak_hz": 0.0,
+            "spec_entropy": 0.0,
+            "band_power_pct": [0.0, 0.0, 0.0],
+        }
+
+    xc = x - np.mean(x)
+    win = np.hanning(n).astype(np.float32)
+    spec = np.abs(np.fft.rfft(xc * win)) ** 2
+    freqs = np.fft.rfftfreq(n, d=1.0 / float(sample_rate))
+
+    mask = (freqs >= FFT_MIN_HZ) & (freqs <= FFT_MAX_HZ)
+    if not np.any(mask):
+        return {
+            "mean_hz": 0.0,
+            "median_hz": 0.0,
+            "peak_hz": 0.0,
+            "spec_entropy": 0.0,
+            "band_power_pct": [0.0, 0.0, 0.0],
+        }
+
+    sv = spec[mask]
+    fv = freqs[mask]
+    total = float(np.sum(sv) + 1e-9)
+
+    peak_hz = float(fv[int(np.argmax(sv))])
+    mean_hz = float(np.sum(sv * fv) / total)
+    csum = np.cumsum(sv)
+    med_hz = float(fv[int(np.argmax(csum >= (0.5 * total)))])
+
+    p = sv / total
+    spec_entropy = float(-np.sum(p * np.log2(p + 1e-12)) / np.log2(len(p) + 1e-9))
+
+    band_power = []
+    for lo, hi in BANDS:
+        bmask = (fv >= lo) & (fv < hi)
+        if np.any(bmask):
+            band_power.append(float(np.sum(sv[bmask]) / total * 100.0))
+        else:
+            band_power.append(0.0)
+
+    return {
+        "mean_hz": mean_hz,
+        "median_hz": med_hz,
+        "peak_hz": peak_hz,
+        "spec_entropy": spec_entropy,
+        "band_power_pct": band_power,
+    }
+
+
+def extract_window_features_legacy(window, sample_rate=500):
+    """Canonical legacy RF implementation used by deployed joblib artifacts.
+
+    Keep its ordering and numerical operations stable. Optimized implementations
+    are deliberately opt-in and tested against this reference.
+    """
+    arr = _ensure_window_shape(window)
+    n_samples = arr.shape[0]
+    n_ch = arr.shape[1]
+    arr_centered = arr - np.mean(arr, axis=0, keepdims=True)
+
+    zc_thresh = 10.0
+    ssc_thresh = 8.0
+    wamp_thresh = 12.0
+
+    feats = []
+    rms_vals = []
+    for ch in range(n_ch):
+        x = arr_centered[:, ch]
+        abs_x = np.abs(x)
+        dx = np.diff(x) if n_samples > 1 else np.array([], dtype=np.float32)
+
+        mav = float(np.mean(abs_x))
+        rms = float(np.sqrt(np.mean(np.square(x))))
+        iemg = float(np.sum(abs_x))
+        var = float(np.var(x))
+        wl = float(np.sum(np.abs(dx))) if dx.size else 0.0
+
+        if n_samples > 1:
+            zc = int(np.sum(((x[:-1] * x[1:]) < 0) & (np.abs(x[:-1] - x[1:]) >= zc_thresh)))
+            wamp = int(np.sum(np.abs(x[1:] - x[:-1]) >= wamp_thresh))
+        else:
+            zc = 0
+            wamp = 0
+
+        if n_samples > 2:
+            s1 = x[1:-1] - x[:-2]
+            s2 = x[1:-1] - x[2:]
+            ssc = int(np.sum(((s1 * s2) > 0) & ((np.abs(s1) + np.abs(s2)) >= ssc_thresh)))
+        else:
+            ssc = 0
+
+        sp = _spectral_1d(x, sample_rate)
+        feats.extend(
+            [
+                mav,
+                rms,
+                iemg,
+                var,
+                wl,
+                float(zc),
+                float(ssc),
+                float(wamp),
+                sp["mean_hz"],
+                sp["median_hz"],
+                sp["peak_hz"],
+                sp["spec_entropy"],
+                sp["band_power_pct"][0],
+                sp["band_power_pct"][1],
+                sp["band_power_pct"][2],
+            ]
+        )
+        rms_vals.append(rms)
+
+    rms_vals = np.asarray(rms_vals, dtype=np.float32)
+    mean_rms = float(np.mean(rms_vals) + 1e-9)
+    feats.extend((rms_vals / mean_rms).tolist())
+
+    # Pairwise channel correlation features.
+    std = np.std(arr_centered, axis=0)
+    valid = np.isfinite(std) & (std > 1e-8)
+    if np.any(valid):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.corrcoef(arr_centered.T)
+    else:
+        corr = np.eye(n_ch, dtype=np.float32)
+    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.all(valid):
+        corr[~valid, :] = 0.0
+        corr[:, ~valid] = 0.0
+        np.fill_diagonal(corr, 1.0)
+    for a in range(n_ch):
+        for b in range(a + 1, n_ch):
+            feats.append(float(corr[a, b]))
+
+    return np.asarray(feats, dtype=np.float32)
+
+
+PREPROCESSING_VERSION = "v2"
+
+
+LEGACY_PREPROCESSING_VERSION = "legacy-baseline-v1"
+
+
+FEATURE_EXTRACTOR_VERSION = "rf_features.v1"
+
+
+@dataclass
+class SampleBatch:
+    """Samples plus transport metadata. Values are never silently discarded."""
+    samples: np.ndarray
+    packet_sequences: Optional[np.ndarray] = None
+    frame_ids: Optional[np.ndarray] = None
+    emg_timestamps: Optional[np.ndarray] = None
+    imu_ids: Optional[np.ndarray] = None
+    imu_timestamps: Optional[np.ndarray] = None
+    host_received_monotonic: float = field(default_factory=time.monotonic)
+    gap_before: int = 0
+    invalid: bool = False
+
+
+@dataclass
+class WirelessStats:
+    packets_received: int = 0
+    packets_missing: int = 0
+    packets_out_of_order: int = 0
+    invalid_packets: int = 0
+    previous_sequence: Optional[int] = None
+    last_arrival: Optional[float] = None
+    arrival_intervals: deque = field(default_factory=lambda: deque(maxlen=200))
+
+    def observe(self, sequence: int, arrival: Optional[float] = None) -> int:
+        """Record one UDP packet and return the number missing before it.
+
+        UDP sequence numbers are unsigned 32-bit; wrap-around is handled.  A
+        duplicate/out-of-order packet is retained in diagnostics but never used
+        to make a gap look like valid continuous data.
+        """
+        arrival = time.monotonic() if arrival is None else arrival
+        self.packets_received += 1
+        gap = 0
+        if self.previous_sequence is not None:
+            delta = (int(sequence) - self.previous_sequence) & 0xFFFFFFFF
+            if delta == 0 or delta > 0x7FFFFFFF:
+                self.packets_out_of_order += 1
+            elif delta > 1:
+                gap = delta - 1
+                self.packets_missing += gap
+        if self.last_arrival is not None:
+            self.arrival_intervals.append(arrival - self.last_arrival)
+        self.previous_sequence = int(sequence)
+        self.last_arrival = arrival
+        return gap
+
+    @property
+    def packet_loss_percent(self) -> float:
+        total = self.packets_received + self.packets_missing
+        return 100.0 * self.packets_missing / total if total else 0.0
+
+    @property
+    def jitter_ms(self) -> float:
+        return float(np.std(self.arrival_intervals) * 1000.0) if len(self.arrival_intervals) > 1 else 0.0
+
+
+@dataclass
+class CalibrationProfile:
+    rest_baseline: np.ndarray
+    rest_std: np.ndarray
+    rest_rms: np.ndarray
+    flex_rms: np.ndarray
+    flex_peak: np.ndarray
+    activation_scale: np.ndarray
+    quality: list[str]
+    valid: bool
+    reasons: list[str]
+    normalization: str = "activation_rms"
+
+
+def compute_calibration(rest: np.ndarray, flex: np.ndarray, *, min_samples: int = 250,
+                        dead_std: float = 1e-3, rest_noise_limit: float = 80.0,
+                        min_activation_ratio: float = 1.25,
+                        saturation_limit: Optional[float] = 65534.0) -> CalibrationProfile:
+    """Quantify calibration, rejecting unsafe captures rather than guessing."""
+    rest = np.asarray(rest, dtype=np.float32)
+    flex = np.asarray(flex, dtype=np.float32)
+    if rest.ndim != 2 or flex.ndim != 2 or rest.shape[1] != flex.shape[1]:
+        raise ValueError("REST and FLEX must be 2-D with identical channel count")
+    channels = rest.shape[1]
+    if rest.shape[0] < min_samples or flex.shape[0] < min_samples:
+        zeros = np.zeros(channels, dtype=np.float32)
+        return CalibrationProfile(zeros, zeros, zeros, zeros, zeros, np.ones(channels),
+                                  ["INSUFFICIENT"] * channels, False,
+                                  ["Insufficient REST or FLEX samples"])
+    baseline = np.median(rest, axis=0)
+    rest_centered = rest - baseline
+    flex_centered = flex - baseline
+    rest_std = np.std(rest_centered, axis=0)
+    rest_rms = np.sqrt(np.mean(rest_centered ** 2, axis=0))
+    flex_rms = np.sqrt(np.mean(flex_centered ** 2, axis=0))
+    flex_peak = np.max(np.abs(flex_centered), axis=0)
+    # RMS activation is robust against one transient; epsilon prevents divide-by-zero.
+    scale = np.maximum(flex_rms, 1e-6)
+    quality, reasons = [], []
+    finite = np.isfinite(rest).all(axis=0) & np.isfinite(flex).all(axis=0)
+    for ch in range(channels):
+        if not finite[ch]:
+            quality.append("INVALID"); reasons.append(f"CH{ch + 1}: NaN/Inf")
+        elif saturation_limit is not None and ((np.abs(rest[:, ch]) >= saturation_limit).any() or (np.abs(flex[:, ch]) >= saturation_limit).any()):
+            quality.append("SATURATED"); reasons.append(f"CH{ch + 1}: saturated")
+        elif rest_std[ch] <= dead_std and flex_rms[ch] <= dead_std:
+            quality.append("DEAD"); reasons.append(f"CH{ch + 1}: no measurable signal")
+        elif rest_std[ch] > rest_noise_limit:
+            quality.append("NOISY"); reasons.append(f"CH{ch + 1}: unstable REST")
+        elif flex_rms[ch] < max(rest_rms[ch] * min_activation_ratio, dead_std * 2):
+            quality.append("WEAK"); reasons.append(f"CH{ch + 1}: insufficient FLEX activation")
+        else:
+            quality.append("GOOD")
+    valid = all(q == "GOOD" for q in quality)
+    return CalibrationProfile(baseline.astype(np.float32), rest_std.astype(np.float32), rest_rms.astype(np.float32),
+                              flex_rms.astype(np.float32), flex_peak.astype(np.float32), scale.astype(np.float32),
+                              quality, valid, reasons)
+
+
+@dataclass
+class PreprocessingConfig:
+    version: str = PREPROCESSING_VERSION
+    sample_rate: float = 500.0
+    highpass_hz: float = 20.0
+    lowpass_hz: float = 220.0
+    notch_hz: float = 50.0
+    notch_q: float = 30.0
+    normalization: str = "activation_rms"  # "none" retains centered ADC scale.
+
+
+class RealTimePreprocessor:
+    """Causal, stateful band-pass + notch processor.
+
+    Cascaded one-pole high/low pass filters and a normalized RBJ notch are
+    stable for the configured 500 Hz stream.  States persist across batches,
+    avoiding the non-causal look-ahead and edge artifacts of ``filtfilt``.
+    """
+    def __init__(self, channels: int, config: PreprocessingConfig, profile: CalibrationProfile):
+        self.channels, self.config, self.profile = int(channels), config, profile
+        if not 0 < config.highpass_hz < config.lowpass_hz < config.sample_rate / 2:
+            raise ValueError("invalid causal band-pass configuration")
+        self._hp_x = np.zeros(channels, np.float64); self._hp_y = np.zeros(channels, np.float64)
+        self._lp_y = np.zeros(channels, np.float64)
+        self._z1 = np.zeros(channels, np.float64); self._z2 = np.zeros(channels, np.float64)
+        dt = 1.0 / config.sample_rate
+        self._hp_a = 1.0 / (1.0 + 1.0 / (2.0 * math.pi * config.highpass_hz * dt))
+        self._lp_a = dt / ((1.0 / (2.0 * math.pi * config.lowpass_hz)) + dt)
+        w0 = 2.0 * math.pi * config.notch_hz / config.sample_rate
+        alpha = math.sin(w0) / (2.0 * config.notch_q)
+        b0, b1, b2, a0, a1, a2 = 1, -2 * math.cos(w0), 1, 1 + alpha, -2 * math.cos(w0), 1 - alpha
+        self._b0, self._b1, self._b2 = b0 / a0, b1 / a0, b2 / a0
+        self._a1, self._a2 = a1 / a0, a2 / a0
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        x = np.asarray(samples, dtype=np.float32)
+        if x.ndim != 2 or x.shape[1] != self.channels or not np.isfinite(x).all():
+            raise ValueError("invalid sample batch for preprocessing")
+        out = np.empty_like(x)
+        baseline = self.profile.rest_baseline
+        scale = self.profile.activation_scale
+        for i, row in enumerate(x):
+            centered = row.astype(np.float64) - baseline
+            hp = self._hp_a * (self._hp_y + centered - self._hp_x)
+            self._hp_x, self._hp_y = centered, hp
+            lp = self._lp_y + self._lp_a * (hp - self._lp_y)
+            self._lp_y = lp
+            y = self._b0 * lp + self._z1
+            self._z1 = self._b1 * lp - self._a1 * y + self._z2
+            self._z2 = self._b2 * lp - self._a2 * y
+            out[i] = y / scale if self.config.normalization != "none" else y
+        return out
+
+
+@dataclass
+class SignalQuality:
+    state: str
+    channel_states: list[str]
+    reason: str = ""
+
+
+def assess_signal_quality(window: np.ndarray, profile: CalibrationProfile, *, saturation_limit: float = 65534.0,
+                          max_noise_multiplier: float = 8.0, min_active_std: float = 1e-4) -> SignalQuality:
+    x = np.asarray(window, dtype=np.float32)
+    if x.ndim != 2 or x.shape[1] != len(profile.quality) or not np.isfinite(x).all():
+        return SignalQuality("SIGNAL_POOR", ["INVALID"] * len(profile.quality), "missing or non-finite samples")
+    states = []
+    for ch in range(x.shape[1]):
+        std, peak = float(np.std(x[:, ch])), float(np.max(np.abs(x[:, ch])))
+        if peak >= saturation_limit: states.append("SATURATED")
+        elif std <= min_active_std: states.append("DEAD")
+        elif profile.rest_std[ch] > 0 and std > max_noise_multiplier * max(profile.flex_rms[ch], profile.rest_std[ch]): states.append("NOISY")
+        else: states.append(profile.quality[ch] if profile.quality[ch] != "GOOD" else "GOOD")
+    bad = [s for s in states if s != "GOOD"]
+    return SignalQuality("GOOD" if not bad else "SIGNAL_POOR", states, ", ".join(bad))
+
+
+@dataclass
+class ModelCompatibility:
+    compatible: bool
+    warnings: list[str]
+    errors: list[str]
+    preprocessing_version: str
+
+
+def expected_feature_count(channels: int) -> int:
+    return 15 * channels + channels + channels * (channels - 1) // 2
+
+
+def validate_model_artifact(artifact: Any, acquisition_rate: Optional[float] = None,
+                            acquisition_channels: Optional[int] = None) -> ModelCompatibility:
+    warnings, errors = [], []
+    if not isinstance(artifact, dict) or "model" not in artifact:
+        return ModelCompatibility(False, warnings, ["Joblib artifact must contain a model"], "unknown")
+    model = artifact["model"]
+    if not hasattr(model, "predict"):
+        errors.append("Model has no predict()")
+    classes = artifact.get("class_names", artifact.get("classes", getattr(model, "classes_", [])))
+    if not list(classes): errors.append("Model classes are missing")
+    version = artifact.get("preprocessing_version", LEGACY_PREPROCESSING_VERSION)
+    if "preprocessing_version" not in artifact: warnings.append("Model preprocessing metadata is missing; using legacy baseline compatibility mode.")
+    if "input_channels" not in artifact: warnings.append("Model input channel metadata is missing; feature count will be used when available.")
+    rate = artifact.get("sample_rate")
+    if rate is None: warnings.append("Model sample-rate metadata is missing; compatibility cannot be fully verified.")
+    elif acquisition_rate is not None and not math.isclose(float(rate), float(acquisition_rate), rel_tol=0, abs_tol=0.01):
+        errors.append(f"Model sample rate ({rate} Hz) differs from acquisition ({acquisition_rate} Hz); resampling is not enabled.")
+    channels = artifact.get("input_channels")
+    if channels is not None and acquisition_channels is not None and int(channels) != int(acquisition_channels):
+        # "input_channels" is the total column count the model was trained on
+        # (EMG plus any IMU columns logged alongside them), not an EMG-only count -
+        # callers must pass the acquisition's matching total, not its EMG-only count.
+        errors.append(f"Model expects {channels} input channel(s) (as trained), device supplies {acquisition_channels}.")
+    count = getattr(model, "n_features_in_", None)
+    if count is not None and channels is not None and int(count) != expected_feature_count(int(channels)):
+        errors.append(f"Model has {count} features; expected {expected_feature_count(int(channels))} for declared channel order.")
+    return ModelCompatibility(not errors, warnings, errors, version)
+
+
+@dataclass
+class Decision:
+    state: str
+    action_allowed: bool
+    click_triggered: bool = False
+
+
+class GestureDecisionEngine:
+    """Temporal gate: actions require sustained, confident, quality-approved labels."""
+    def __init__(self, *, vote_windows: int = 5, consecutive_required: int = 3,
+                 min_confidence: float = .65, min_margin: float = .10, refractory_s: float = .8):
+        self.history = deque(maxlen=vote_windows); self.consecutive_required = consecutive_required
+        self.min_confidence, self.min_margin, self.refractory_s = min_confidence, min_margin, refractory_s
+        self.active: Optional[str] = None; self.candidate: Optional[str] = None; self.candidate_count = 0
+        self.last_click = -float("inf")
+
+    def update(self, label: Optional[str], confidence: Optional[float], margin: Optional[float], quality_good: bool,
+               now: Optional[float] = None) -> Decision:
+        now = time.monotonic() if now is None else now
+        valid = quality_good and label not in (None, "", "REST", "UNKNOWN") and confidence is not None and confidence >= self.min_confidence and (margin is None or margin >= self.min_margin)
+        if not valid:
+            self.history.clear(); self.candidate = None; self.candidate_count = 0; self.active = None
+            return Decision("REST" if label == "REST" and quality_good else "UNKNOWN", False)
+        self.history.append(label)
+        voted = Counter(self.history).most_common(1)[0][0]
+        if voted != self.candidate:
+            self.candidate, self.candidate_count = voted, 1
+        else: self.candidate_count += 1
+        if self.candidate_count < self.consecutive_required:
+            return Decision("GESTURE_CANDIDATE", False)
+        if self.active != voted:
+            self.active = voted
+            return Decision(f"{voted}_ACTIVE", True)
+        return Decision(f"{voted}_HELD", True)
+
+    def trigger_click_once(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else now
+        if now - self.last_click < self.refractory_s: return False
+        self.last_click = now
+        return True
+
+
+class SampleRingBuffer:
+    """Fixed-size, single-producer ring buffer with explicit gap recovery.
+
+    The caller obtains one chronological copy only when an inference/analysis
+    window is actually required; ingest never shifts the complete history.
+    """
+    def __init__(self, channels: int, capacity: int, dtype=np.float32) -> None:
+        if channels <= 0 or capacity <= 0:
+            raise ValueError("channels and capacity must be positive")
+        self.channels, self.capacity = int(channels), int(capacity)
+        self.data = np.empty((self.capacity, self.channels), dtype=dtype)
+        self.write_index = 0
+        self.sample_count = 0
+        self.generation = 0
+        self.invalid_until_generation = 0
+
+    def reset(self) -> None:
+        self.write_index = self.sample_count = self.generation = self.invalid_until_generation = 0
+
+    def append(self, samples: np.ndarray, *, discontinuity: bool = False) -> int:
+        x = np.asarray(samples, dtype=self.data.dtype)
+        if x.ndim != 2 or x.shape[1] != self.channels:
+            raise ValueError("sample shape does not match ring channels")
+        n = len(x)
+        if not n: return 0
+        if discontinuity:
+            # Never synthesize data; require a clean subsequent window.
+            self.sample_count = 0
+            self.invalid_until_generation = self.generation + self.capacity
+        if n >= self.capacity:
+            self.data[:, :] = x[-self.capacity:]
+            self.write_index = 0
+            self.sample_count = self.capacity
+        else:
+            first = min(n, self.capacity - self.write_index)
+            self.data[self.write_index:self.write_index + first] = x[:first]
+            remaining = n - first
+            if remaining: self.data[:remaining] = x[first:]
+            self.write_index = (self.write_index + n) % self.capacity
+            self.sample_count = min(self.capacity, self.sample_count + n)
+        self.generation += n
+        return n
+
+    def has_window(self, size: int) -> bool:
+        return 0 < size <= self.capacity and self.sample_count >= size and self.generation >= self.invalid_until_generation
+
+    def latest(self, size: int, out: Optional[np.ndarray] = None) -> np.ndarray:
+        if not self.has_window(size):
+            raise ValueError("no continuous window available")
+        if out is None:
+            out = np.empty((size, self.channels), dtype=self.data.dtype)
+        if out.shape != (size, self.channels):
+            raise ValueError("output window shape mismatch")
+        start = (self.write_index - size) % self.capacity
+        first = min(size, self.capacity - start)
+        out[:first] = self.data[start:start + first]
+        if first < size: out[first:] = self.data[:size - first]
+        return out
+
+
+@dataclass
+class LatencySnapshot:
+    count: int = 0
+    min_ms: float = 0.0
+    mean_ms: float = 0.0
+    p50_ms: float = 0.0
+    p95_ms: float = 0.0
+    p99_ms: float = 0.0
+    max_ms: float = 0.0
+
+
+class StageProfiler:
+    """Bounded high-resolution stage timings; no I/O on the hot path."""
+    def __init__(self, history: int = 2048) -> None:
+        self._samples: dict[str, deque[int]] = {}
+        self._history = history
+
+    @staticmethod
+    def now_ns() -> int: return time.perf_counter_ns()
+
+    def record_ns(self, stage: str, start_ns: int, end_ns: Optional[int] = None) -> None:
+        elapsed = (self.now_ns() if end_ns is None else end_ns) - start_ns
+        self._samples.setdefault(stage, deque(maxlen=self._history)).append(max(0, elapsed))
+
+    def snapshot(self) -> dict[str, LatencySnapshot]:
+        answer = {}
+        for stage, values in self._samples.items():
+            a = np.asarray(values, dtype=np.float64) / 1_000_000.0
+            answer[stage] = LatencySnapshot(len(a), float(a.min()), float(a.mean()), float(np.percentile(a, 50)),
+                                            float(np.percentile(a, 95)), float(np.percentile(a, 99)), float(a.max()))
+        return answer
+
+
+
+DEFAULT_BAUD_RATE = 921600         # Wired EMG stream baud rate.
+USB_SERIAL_BAUD = 115200           # Baud rate used only for USB provisioning handshakes.
+SERIAL_BOOT_WAIT_S = 3.5
+SERIAL_RESPONSE_TIMEOUT_S = 15.0
+SAMPLE_RATE = 500                  # Hz, matches the ESP32 firmware.
+WINDOW_SIZE = 1000                 # Rolling sample buffer length (channels x samples).
+DEFAULT_WIRED_CHANNELS = 4
+
+DEFAULT_DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
+WIFI_STREAM_PORT = 5000
+WIFI_CONTROL_PORT = 5001
+DISCOVERY_ADDRESS = "255.255.255.255"
+DISCOVERY_TIMEOUT = 1.2
+CONTROL_TIMEOUT = 2.0
+KEEPALIVE_INTERVAL_MS = 2000       # Matches main app: periodic PING keeps the ESP32 stream alive.
+KEEPALIVE_MAX_FAILURES = 3         # Consecutive failed pings before we flag the link as lost.
+
+WIRELESS_EMG_CHANNELS = 8
+WIRELESS_IMU_CHANNELS = 3
+WIRELESS_TOTAL_CHANNELS = WIRELESS_EMG_CHANNELS + WIRELESS_IMU_CHANNELS
+WIFI_PACKET_HEADER_FORMAT = "<4sBBHI"
+WIFI_PACKET_HEADER_SIZE = struct.calcsize(WIFI_PACKET_HEADER_FORMAT)
+WIRELESS_FRAME_FORMAT = "<IIII8HfffB3x"
+WIRELESS_FRAME_SIZE = struct.calcsize(WIRELESS_FRAME_FORMAT)
+WIRELESS_FRAMES_PER_PACKET = 5
+WIRELESS_PACKET_SIZE = WIFI_PACKET_HEADER_SIZE + (WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET)
+
+CAL_TICK_MS = 100
+CAL_REST_MS = 3000
+CAL_FLEX_MS = 3000
+CAL_DURATION_MIN_S = 3
+CAL_DURATION_MAX_S = 10
+BASE_ADAPT_ALPHA = 0.001           # Slow baseline drift compensation.
+BASE_ADAPT_GUARD = 80.0            # Only adapt baseline while signal is near rest.
+RF_LABEL_SMOOTH_WINDOW = 5         # Majority-vote smoothing window for displayed label.
+GESTURE_MIN_CONFIDENCE_DEFAULT = 65.0
+MAX_INFERENCE_PACKET_GAP = 1        # A larger UDP loss invalidates a window; never classify it.
+
+LOG = logging.getLogger("biowave.emg")
+extract_window_features = extract_window_features_legacy      # the ONE feature extractor (matches the trainer)
+HAS_RF_FEATURES = True
+PLOT_SAMPLES = 1000                 # 2 s of live EMG at 500 Hz
+PLOT_COLORS = ["#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4", "#46f0f0", "#f032e6"]
+STREAM_STALL_S = 1.5                # no samples for this long -> arm control is switched off
+DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "BioWaveEMG_ArmBand" / "trained_model"
+
+
+# ---- wireless protocol
+def sign_message(secret, *parts):
+    message = "|".join(str(part) for part in parts)
+    return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def get_local_ip_for_target(target_ip):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((target_ip, 1))
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
+@dataclass
+class DeviceInfo:
+    ip: str
+    device_id: str
+    device_name: str
+    wifi_mode: str
+    reported_ip: str
+    imu_ready: bool
+    streaming: bool
+    firmware: str
+
+    @property
+    def summary(self):
+        return f"{self.device_name} @ {self.ip} ({self.wifi_mode})"
+
+
+@dataclass
+class SerialDeviceInfo:
+    port_name: str
+    device_id: str
+    device_name: str
+    imu_ready: bool
+    wifi_saved: bool
+    firmware: str
+
+
+class ControlProtocol:
+    """UDP control-plane protocol for discovering and driving the wireless
+    BioWave EMG device (mirrors the ESP32 firmware's HELLO/CHALLENGE/START/STOP)."""
+
+    @staticmethod
+    def parse_device_info(message, source_ip):
+        parts = message.strip().split("|")
+        if len(parts) != 8 or parts[0] != "HELLO":
+            raise ValueError("Unexpected device response.")
+        return DeviceInfo(
+            ip=source_ip,
+            device_id=parts[1],
+            device_name=parts[2],
+            wifi_mode=parts[3],
+            reported_ip=parts[4],
+            imu_ready=parts[5] == "1",
+            streaming=parts[6] == "1",
+            firmware=parts[7],
+        )
+
+    @staticmethod
+    def send_and_receive(message, target_ip, expect_multiple=False, timeout=CONTROL_TIMEOUT, broadcast=False):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2 if expect_multiple else timeout)
+        if broadcast:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        responses = []
+        deadline = time.monotonic() + timeout
         try:
-            if self._conn:
-                self._conn.send(("quit",))
+            sock.sendto(message.encode("utf-8"), (target_ip, WIFI_CONTROL_PORT))
+            if expect_multiple:
+                while time.monotonic() < deadline:
+                    try:
+                        data, addr = sock.recvfrom(2048)
+                        responses.append((data.decode("utf-8", errors="replace"), addr[0]))
+                    except socket.timeout:
+                        continue
+                return responses
+
+            data, addr = sock.recvfrom(2048)
+            return data.decode("utf-8", errors="replace"), addr[0]
+        finally:
+            sock.close()
+
+    @staticmethod
+    def discover():
+        devices = {}
+        responses = ControlProtocol.send_and_receive(
+            "DISCOVER", DISCOVERY_ADDRESS, expect_multiple=True,
+            timeout=DISCOVERY_TIMEOUT, broadcast=True,
+        )
+        for response, source_ip in responses:
+            try:
+                device = ControlProtocol.parse_device_info(response, source_ip)
+                devices[device.ip] = device
+            except ValueError:
+                continue
+        return list(devices.values())
+
+    @staticmethod
+    def get_challenge(target_ip):
+        response, _ = ControlProtocol.send_and_receive("CHALLENGE", target_ip)
+        parts = response.strip().split("|")
+        if len(parts) != 2 or parts[0] != "CHALLENGE":
+            raise RuntimeError("Device did not return a valid challenge.")
+        return parts[1]
+
+    @staticmethod
+    def authenticated_command(target_ip, secret, command, *payload):
+        if not secret:
+            raise RuntimeError("Device access key is required.")
+        challenge = ControlProtocol.get_challenge(target_ip)
+        auth = sign_message(secret, command, challenge, *payload)
+        message = "|".join([command, challenge, *payload, auth])
+        response, _ = ControlProtocol.send_and_receive(message, target_ip)
+
+        parts = response.strip().split("|")
+        if not parts:
+            raise RuntimeError("Device returned an empty response.")
+        if parts[0] == "ERR":
+            detail = parts[1] if len(parts) > 1 else "UNKNOWN"
+            raise RuntimeError(f"Device rejected command: {detail}")
+        if parts[0] != "ACK":
+            raise RuntimeError("Unexpected device acknowledgement.")
+        return parts[1:]
+
+    @staticmethod
+    def start_stream(target_ip, secret, client_ip, client_port):
+        return ControlProtocol.authenticated_command(target_ip, secret, "START", client_ip, str(client_port))
+
+    @staticmethod
+    def stop_stream(target_ip, secret):
+        return ControlProtocol.authenticated_command(target_ip, secret, "STOP")
+
+    @staticmethod
+    def ping(target_ip, secret):
+        return ControlProtocol.authenticated_command(target_ip, secret, "PING")
+
+
+class WiFiSerialProvisionProtocol:
+    """One-time USB handshake used to hand Wi-Fi credentials to a fresh ESP32."""
+
+    @staticmethod
+    def available_ports():
+        return list(serial.tools.list_ports.comports())
+
+    @staticmethod
+    def _exchange_line(port_name, command, expected_prefixes, timeout=SERIAL_RESPONSE_TIMEOUT_S):
+        try:
+            with serial.Serial(port_name, USB_SERIAL_BAUD, timeout=0.3, write_timeout=1) as ser:
+                ser.setDTR(False)
+                ser.setRTS(False)
+                time.sleep(0.15)
+                time.sleep(SERIAL_BOOT_WAIT_S)
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                ser.write((command + "\n").encode("utf-8"))
+                ser.flush()
+
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    raw_line = ser.readline()
+                    if not raw_line:
+                        continue
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if any(line.startswith(prefix) for prefix in expected_prefixes):
+                        return line
+        except serial.SerialException as exc:
+            raise RuntimeError(f"Serial communication failed on {port_name}: {exc}") from exc
+        raise RuntimeError("The ESP32 did not return a serial response in time.")
+
+    @staticmethod
+    def query_info(port_name):
+        response = WiFiSerialProvisionProtocol._exchange_line(port_name, "INFO", expected_prefixes=("INFO|", "ERR|"))
+        parts = response.split("|")
+        if len(parts) >= 2 and parts[0] == "ERR":
+            raise RuntimeError(f"ESP32 returned an error: {parts[1]}")
+        if len(parts) != 6 or parts[0] != "INFO":
+            raise RuntimeError(f"Unexpected serial response: {response}")
+        return SerialDeviceInfo(
+            port_name=port_name, device_id=parts[1], device_name=parts[2],
+            imu_ready=parts[3] == "1", wifi_saved=parts[4] == "1", firmware=parts[5],
+        )
+
+    @staticmethod
+    def provision(port_name, ssid, password):
+        encoded_ssid = quote(ssid, safe="")
+        encoded_password = quote(password, safe="")
+        response = WiFiSerialProvisionProtocol._exchange_line(
+            port_name, f"PROVISION|{encoded_ssid}|{encoded_password}",
+            expected_prefixes=("ACK|", "ERR|"), timeout=8.0,
+        )
+        parts = response.split("|")
+        if len(parts) >= 2 and parts[0] == "ACK" and parts[1] == "PROVISIONED":
+            return
+        if len(parts) >= 2 and parts[0] == "ERR":
+            raise RuntimeError(f"ESP32 rejected provisioning: {parts[1]}")
+        raise RuntimeError(f"Unexpected serial response: {response}")
+
+
+# ====================================================================================================
+# THEME   (from app_theme.py: same palette / stylesheet as the BioWave apps)
+# ====================================================================================================
+
+THEME_COLORS = {
+    "special": "#BF092F",
+    "bg": "#132440",
+    "title_bar": "#0D1B33",
+    "panel": "#16476A",
+    "accent": "#3B9797",
+    "success": "#3B9797",
+    "graph_bg": "#132440",
+    "text": "#E8EEF0",
+    "muted": "#A9C2CF",
+    "disabled": "#6F8A99",
+}
+
+
+def apply_dark_title_bar(window):
+    """Request a dark native title bar on Windows where supported."""
+    try:
+        import ctypes
+        import sys
+        from ctypes import wintypes
+    except Exception:
+        return False
+
+    if sys.platform != "win32":
+        return False
+
+    try:
+        hwnd = int(window.winId())
+    except Exception:
+        return False
+
+    def _hex_to_colorref(hex_color):
+        val = (hex_color or "").strip().lstrip("#")
+        if len(val) != 6:
+            return None
+        try:
+            r = int(val[0:2], 16)
+            g = int(val[2:4], 16)
+            b = int(val[4:6], 16)
+        except ValueError:
+            return None
+        return (b << 16) | (g << 8) | r
+
+    use_dark = ctypes.c_int(1)
+    use_dark_size = ctypes.sizeof(use_dark)
+    attrs = (20, 19)  # Win10 20H1+, then legacy fallback
+    enabled_dark = False
+    for attr in attrs:
+        try:
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd),
+                wintypes.DWORD(attr),
+                ctypes.byref(use_dark),
+                wintypes.DWORD(use_dark_size),
+            )
+            if result == 0:
+                enabled_dark = True
+                break
+        except Exception:
+            continue
+
+    caption_color = _hex_to_colorref(THEME_COLORS.get("title_bar", THEME_COLORS["bg"]))
+    text_color = _hex_to_colorref(THEME_COLORS["text"])
+    if caption_color is not None:
+        try:
+            caption_val = ctypes.c_int(caption_color)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd),
+                wintypes.DWORD(35),  # DWMWA_CAPTION_COLOR
+                ctypes.byref(caption_val),
+                wintypes.DWORD(ctypes.sizeof(caption_val)),
+            )
         except Exception:
             pass
-        if self._thread:
-            self._thread.join(timeout=2.0)
-        if self._proc:
-            self._proc.join(timeout=3.0)
-            if self._proc.is_alive():
-                self._proc.terminate()
+    if text_color is not None:
+        try:
+            text_val = ctypes.c_int(text_color)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd),
+                wintypes.DWORD(36),  # DWMWA_TEXT_COLOR
+                ctypes.byref(text_val),
+                wintypes.DWORD(ctypes.sizeof(text_val)),
+            )
+        except Exception:
+            pass
+    return enabled_dark
 
-    def _handle(self, msg) -> None:
-        kind = msg[0]
-        if kind == "cmd":
-            self.ctl.submit(msg[1])
-        elif kind == "gesture" and self.gesture_source is not None:
-            if msg[1] is None:
-                self.gesture_source.release()
-            else:
-                self.gesture_source.set_gesture(msg[1])
-        elif kind == "demo" and self.on_demo is not None:
-            self.on_demo()
-        elif kind == "closed":
-            self.closed.set()
 
-    def _loop(self) -> None:
-        nxt = time.perf_counter()
-        n = 0
-        while not self._stop.is_set() and not self.closed.is_set():
-            try:
-                while self._conn.poll():
-                    self._handle(self._conn.recv())
-                if not self._proc.is_alive():
-                    self.closed.set()
-                    break
-                st = self.backend.view_state()
-                snap = self.ctl.snapshot()
-                st["telemetry"] = snap
-                self._conn.send(("state", st))
-                n += 1
-                if self.dashboard and n % 3 == 0:
-                    self._print_dashboard(snap)
-            except (EOFError, BrokenPipeError, OSError):
-                self.closed.set()
-                break
-            nxt += self.period
-            delay = nxt - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                nxt = time.perf_counter()
+def app_stylesheet(font_size=16):
+    c = THEME_COLORS
+    default_font = "Bahnschrift" if os.name == "nt" else "Sans Serif"
+    return f"""
+QWidget {{
+    background-color: {c['bg']};
+    color: {c['text']};
+    font-family: "{default_font}";
+    font-size: {int(font_size)}px;
+}}
+QMainWindow, QDialog {{
+    background-color: {c['bg']};
+}}
+QLabel {{
+    color: {c['text']};
+}}
+QPushButton {{
+    background-color: {c['accent']};
+    color: {c['text']};
+    border: 1px solid {c['accent']};
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-weight: 600;
+}}
+QPushButton:hover {{
+    background-color: {c['panel']};
+    color: {c['text']};
+}}
+QPushButton:pressed {{
+    background-color: {c['special']};
+    border-color: {c['special']};
+}}
+QPushButton:disabled {{
+    background-color: {c['panel']};
+    color: {c['disabled']};
+    border-color: {c['accent']};
+}}
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+    background-color: {c['panel']};
+    color: {c['text']};
+    border: 1px solid {c['accent']};
+    border-radius: 6px;
+    padding: 4px 6px;
+    selection-background-color: {c['accent']};
+}}
+QComboBox QAbstractItemView {{
+    background-color: {c['panel']};
+    color: {c['text']};
+    selection-background-color: {c['accent']};
+    border: 1px solid {c['accent']};
+}}
+QCheckBox {{
+    spacing: 6px;
+}}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+}}
+QTabWidget::pane {{
+    border: 1px solid {c['accent']};
+    background: {c['panel']};
+}}
+QTabBar::tab {{
+    background: {c['panel']};
+    color: {c['muted']};
+    border: 1px solid {c['accent']};
+    padding: 6px 12px;
+}}
+QTabBar::tab:selected {{
+    background: {c['accent']};
+    color: {c['text']};
+}}
+QHeaderView::section {{
+    background-color: {c['panel']};
+    color: {c['text']};
+    border: 1px solid {c['accent']};
+    padding: 4px;
+}}
+QTableWidget {{
+    background-color: {c['panel']};
+    color: {c['text']};
+    gridline-color: {c['accent']};
+    border: 1px solid {c['accent']};
+}}
+QProgressBar {{
+    border: 1px solid {c['accent']};
+    border-radius: 5px;
+    text-align: center;
+    background-color: {c['panel']};
+    color: {c['text']};
+}}
+QProgressBar::chunk {{
+    background-color: {c['success']};
+}}
+QScrollArea {{
+    border: 1px solid {c['accent']};
+    background-color: {c['panel']};
+}}
+QScrollBar:vertical {{
+    border: none;
+    background: {c['bg']};
+    width: 10px;
+    margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {c['accent']};
+    min-height: 24px;
+    border-radius: 5px;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+    background: transparent;
+    border: none;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: {c['bg']};
+}}
+QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {{
+    background: transparent;
+    width: 0px;
+    height: 0px;
+}}
+QScrollBar:horizontal {{
+    border: none;
+    background: {c['bg']};
+    height: 10px;
+    margin: 0;
+}}
+QScrollBar::handle:horizontal {{
+    background: {c['accent']};
+    min-width: 24px;
+    border-radius: 5px;
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0px;
+    background: transparent;
+    border: none;
+}}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: {c['bg']};
+}}
+QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal {{
+    background: transparent;
+    width: 0px;
+    height: 0px;
+}}
+"""
 
-    def _print_dashboard(self, snap) -> None:
-        lines = telemetry_lines(snap, self.mode)
-        up = "\x1b[%dA" % len(lines) if self._dash_drawn else ""
-        sys.stdout.write(up + "".join(l[:200].ljust(150) + "\n" for l in lines))
-        sys.stdout.flush()
-        self._dash_drawn = True
+
+def configure_high_dpi():
+    """Call once, before constructing QApplication.
+
+    Without this, PyQt5 can report window/widget sizes in physical pixels on
+    a Retina/HiDPI display (every MacBook since ~2012, plus most Windows
+    laptops today) instead of logical points, which is what makes a window
+    sized for a "normal" screen come out oversized and clip its own buttons.
+    """
+    try:
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QApplication
+
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    except Exception:
+        pass
+
+
+# ====================================================================================================
+# EMG -> ARM BRIDGE   (Qt-free, unit-tested: tests/test_emg_arm_bridge.py)
+# ====================================================================================================
+# Model class name  --(user mapping)-->  arm action  --(decision engine gate)-->  MotionCommand.
+#
+# The BioWave decision engine (confidence + margin + debounce + signal-quality gate) already decides whether a
+# gesture may act, so the bridge does not smooth a second time: an allowed gesture is sent as a continuous jog
+# every inference tick (~20 Hz), and the planner's command timeout stops the arm by itself if predictions stop.
+
+ARM_ACTIONS = {
+    "Ignore (hold)":        None,
+    "Move Left  (-X)":      ("CARTESIAN", "LEFT"),
+    "Move Right (+X)":      ("CARTESIAN", "RIGHT"),
+    "Move Up    (+Z)":      ("CARTESIAN", "UP"),
+    "Move Down  (-Z)":      ("CARTESIAN", "DOWN"),
+    "Move Forward (+Y)":    ("CARTESIAN", "FORWARD"),
+    "Move Backward (-Y)":   ("CARTESIAN", "BACKWARD"),
+    "Close Gripper":        ("GRIPPER", "CLOSE"),
+    "Open Gripper":         ("GRIPPER", "OPEN"),
+}
+IGNORE_ACTION = "Ignore (hold)"
+REST_LABELS = {"rest", "idle", "none", "neutral", "relax", "relaxed", "hold"}
+
+
+def is_rest_label(label) -> bool:
+    return str(label).strip().lower().replace("-", "_") in REST_LABELS
+
+
+def default_arm_action(class_name: str) -> str:
+    """Sensible first guess for a trained class name (the user can change it in the mapping panel)."""
+    c = str(class_name).strip().lower().replace("-", "_").replace(" ", "_")
+    if is_rest_label(c):
+        return IGNORE_ACTION
+    if "open" in c:
+        return "Open Gripper"
+    if "fist" in c or "close" in c or "click" in c or "grip" in c or "grab" in c:
+        return "Close Gripper"
+    for key, action in (("left", "Move Left  (-X)"), ("right", "Move Right (+X)"), ("up", "Move Up    (+Z)"),
+                        ("down", "Move Down  (-Z)"), ("forward", "Move Forward (+Y)"),
+                        ("back", "Move Backward (-Y)")):
+        if key in c:
+            return action
+    return IGNORE_ACTION
+
+
+class EMGArmBridge:
+    def __init__(self, sink: Callable[[MotionCommand], bool], status_callback=None,
+                 speed_m_s: float = EMG_SPEED_M_S, engine: "GestureDecisionEngine | None" = None):
+        self.sink = sink
+        self.status_callback = status_callback
+        self.speed = speed_m_s
+        self.engine = engine or GestureDecisionEngine()
+        self.action_map: dict[str, str] = {}
+        self.enabled = False
+        self.last_action = IGNORE_ACTION
+        self.last_decision = "UNKNOWN"
+        self._moving = False
+
+    def set_mapping(self, class_names) -> None:
+        self.action_map = {str(c): default_arm_action(c) for c in class_names}
+
+    def set_action(self, class_name: str, action: str) -> None:
+        if action not in ARM_ACTIONS:
+            raise ValueError(f"unknown arm action {action!r}")
+        self.action_map[str(class_name)] = action
+
+    def enable(self, on: bool) -> None:
+        if not on:
+            self.release("control disabled")
+        self.enabled = bool(on)
+
+    def _stop_motion(self) -> None:
+        if self._moving:
+            self.sink(MotionCommand.hold(source="emg"))
+        self._moving = False
+        self.last_action = IGNORE_ACTION
+
+    def release(self, reason: str = "") -> None:
+        """Fail-safe: stop any jog we started AND forget the gesture history. Safe to call repeatedly."""
+        self._stop_motion()
+        self.engine.history.clear()
+        self.engine.candidate, self.engine.candidate_count, self.engine.active = None, 0, None
+
+    def on_prediction(self, label, confidence, margin, quality_good: bool) -> str:
+        """Feed one classifier output. Returns the arm action that was executed (or IGNORE_ACTION)."""
+        label = str(label)
+        engine_label = "REST" if is_rest_label(label) else label
+        decision = self.engine.update(engine_label, confidence, margin, quality_good)
+        self.last_decision = decision.state
+        action = self.action_map.get(label, IGNORE_ACTION)
+        spec = ARM_ACTIONS.get(action)
+        if self.status_callback:
+            self.status_callback(label, confidence)
+        if not self.enabled:
+            return IGNORE_ACTION
+        if not decision.action_allowed or spec is None:
+            self._stop_motion()
+            return IGNORE_ACTION
+        kind, direction = spec
+        kw = dict(source="emg", gesture=label, confidence=confidence)
+        if kind == "CARTESIAN":
+            self.sink(MotionCommand(CARTESIAN, direction, magnitude=None, speed=self.speed, **kw))
+            self._moving = True
+        else:                                    # gripper: once per refractory period, not every tick
+            if self.engine.trigger_click_once():
+                self.sink(MotionCommand.gripper(direction, **kw))
+        self.last_action = action
+        return action
 
 
 # ====================================================================================================
 # RUNTIME: wires everything together and owns the threads   (from runtime.py)
 # ====================================================================================================
 #     thread "emg-input"   : EMGController polls the EMG source, smooths, maps -> MotionCommand queue
-#     thread "control"     : fixed-rate loop (default 240 Hz): planner/IK, servos, physics (DIRECT client), safety, log
-#     thread "viewer-link" : 30 Hz bridge to the GUI process (state out, MotionCommands in) + terminal dashboard
+#     thread "control"     : fixed-rate loop (default 120 Hz): planner/IK, servos, MuJoCo physics, safety, log
 #     thread "demo"        : optional pick-and-place sequence (key P / button)
-#     process "viewer"     : PyBullet GUI window - isolated because GUI calls can block 100+ ms and must own a
-#                            main thread on macOS
+#     main thread (Qt)     : dashboard + off-screen MuJoCo rendering (30 fps), reads controller.snapshot()
 # The only coupling between them is the thread-safe ``controller.submit(MotionCommand)`` queue and
 # ``controller.snapshot()``.
 log = get_logger("arm")
@@ -3461,20 +4487,16 @@ class KeepAwake:
 class SimulationRuntime:
     def __init__(self, config_path=None, mode: str = "full", emg_kind: str = "keyboard", headless: bool = False,
                  physics: bool = True, control_hz: float = DEFAULT_CONTROL_HZ, log_dir: str = "logs",
-                 objects: bool = True, show_frames: bool = True, threshold: float = EMG_CONFIDENCE_THRESHOLD,
-                 window: int = SMOOTHING_WINDOW, save_log: bool = True, gui_fps: float = 30.0,
-                 panel: bool = False):
+                 objects: bool = True, threshold: float = EMG_CONFIDENCE_THRESHOLD,
+                 window: int = SMOOTHING_WINDOW, save_log: bool = True):
         self.mode, self.headless = mode, headless
-        self.gui_fps, self.panel = gui_fps, panel
         self.cfg = load_config(config_path)
         self.env = Environment.default_scene() if objects else Environment()
-        use_pb = physics and pybullet_available()
-        if not headless and not use_pb:
-            raise SystemExit("The 3D view needs PyBullet:  pip install pybullet\n"
-                             "(or run with --headless for a console-only simulation)")
-        if physics and not use_pb:
-            log.warning("PyBullet not installed: running with the kinematic backend (no objects/contacts)")
-        self.backend = (PyBulletBackend(self.cfg, dt=1.0 / control_hz) if use_pb else KinematicBackend())
+        use_mj = physics and mujoco_available()
+        if physics and not use_mj:
+            log.warning("MuJoCo not installed (pip install mujoco): running with the kinematic backend "
+                        "(no 3D view, objects or contacts)")
+        self.backend = MuJoCoBackend(self.cfg, dt=1.0 / control_hz) if use_mj else KinematicBackend()
         self.logger = SessionLogger(log_dir) if save_log else None
         self.controller = SimulatedRobotController(self.cfg, self.backend, control_hz=control_hz,
                                                    session_logger=self.logger)
@@ -3496,8 +4518,6 @@ class SimulationRuntime:
                                  status_callback=self.controller.set_emg_status, confidence_threshold=threshold,
                                  window=window, latency=self.controller.latency)
         self.keep_awake = KeepAwake()
-        self.viewer = None
-        self.show_frames = show_frames
         self._stop = threading.Event()
         self._ctl_thread: threading.Thread | None = None
         self._demo_thread: threading.Thread | None = None
@@ -3513,18 +4533,12 @@ class SimulationRuntime:
             self.emg.connect()
             self.emg.start()
         if not self.headless:
-            self.viewer = ViewerLink(self.cfg, self.env, self.backend, self.controller, self.mode,
-                                     self.show_frames, gesture_source=self.kb_source, on_demo=self.start_demo,
-                                     gui_fps=self.gui_fps, panel=self.panel)
-            self.viewer.start()
             print(KEY_HELP + "\n")
         log.info("runtime started (mode=%s, headless=%s, backend=%s, log=%s)", self.mode, self.headless,
                  type(self.backend).__name__, self.logger.path if self.logger else "off")
 
     def stop(self) -> None:
         self._stop.set()
-        if self.viewer:
-            self.viewer.stop()
         self.emg.disconnect()
         if self._ctl_thread:
             self._ctl_thread.join(timeout=2.0)
@@ -3582,18 +4596,17 @@ class SimulationRuntime:
 
     # ------------------------------------------------------------------ run modes
     def run(self, duration: float | None = None) -> None:
-        """Real-time run: control thread + EMG thread (+ GUI viewer process). Ctrl-C or closing the window ends it."""
+        """Console run: control thread + EMG thread, status once per sim second. Ctrl-C ends it."""
         self.start()
         t_end = None if duration is None else time.perf_counter() + duration
         try:
             last = 0.0
-            while (t_end is None or time.perf_counter() < t_end) and not (self.viewer and self.viewer.closed.is_set()):
+            while t_end is None or time.perf_counter() < t_end:
                 time.sleep(0.1)
-                if self.viewer is None:                      # headless: console status once per sim second
-                    s = self.controller.snapshot()
-                    if s.sim_time - last >= 1.0:
-                        last = s.sim_time
-                        self.print_status(s)
+                s = self.controller.snapshot()
+                if s.sim_time - last >= 1.0:
+                    last = s.sim_time
+                    self.print_status(s)
         except KeyboardInterrupt:
             pass
         finally:
@@ -3628,6 +4641,1625 @@ class SimulationRuntime:
 
 
 # ====================================================================================================
+# UI: BIOWAVE-STYLE DASHBOARD   (PyQt5; main process only - the PyBullet viewer child never loads Qt)
+# ====================================================================================================
+# Needs:  pip install PyQt5 pyqtgraph pyserial joblib scikit-learn
+# Without PyQt5 the simulator still runs exactly as before (keyboard + terminal dashboard).
+
+if HAS_QT:
+    class SerialWorker(QThread):
+        """Reads a live EMG stream over USB/COM serial (or a socket:// simulator)."""
+        batch_received = pyqtSignal(object)
+        error_occurred = pyqtSignal(str)
+
+        def __init__(self, port_name, baud_rate, num_channels, batch_size=25):
+            super().__init__()
+            self.port_name = port_name
+            self.baud_rate = baud_rate
+            self.num_channels = num_channels
+            self.batch_size = batch_size
+            self.is_socket_url = str(port_name).strip().lower().startswith("socket://")
+            self._running = True
+            self._serial = None
+
+        def _close_serial(self):
+            try:
+                if self._serial and self._serial.is_open:
+                    self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+
+        def run(self):
+            partial_line = ""
+            batch = []
+            try:
+                while self._running:
+                    try:
+                        if self._serial is None or not self._serial.is_open:
+                            self._serial = serial.serial_for_url(self.port_name, self.baud_rate, timeout=0.02)
+                            try:
+                                self._serial.reset_input_buffer()
+                            except Exception:
+                                pass
+                            partial_line = ""
+
+                        waiting = self._serial.in_waiting
+                        chunk = self._serial.read(waiting if waiting else 1)
+                        if not chunk:
+                            time.sleep(0.001)
+                            continue
+
+                        partial_line += chunk.decode("utf-8", errors="ignore")
+                        lines = partial_line.split("\n")
+                        partial_line = lines.pop()
+
+                        for raw_line in lines:
+                            line = raw_line.strip()
+                            if not line:
+                                continue
+                            parts = line.replace(",", " ").split()
+                            if len(parts) < self.num_channels:
+                                continue
+                            try:
+                                vals = [float(parts[i]) for i in range(self.num_channels)]
+                            except ValueError:
+                                continue
+                            batch.append(vals)
+                            if len(batch) >= self.batch_size:
+                                self.batch_received.emit(np.asarray(batch, dtype=np.float32))
+                                batch = []
+                    except Exception as e:
+                        if not self._running:
+                            break
+                        self._close_serial()
+                        partial_line = ""
+                        if self.is_socket_url:
+                            time.sleep(0.3)
+                            continue
+                        self.error_occurred.emit(str(e))
+                        break
+            finally:
+                self._close_serial()
+
+        def stop(self):
+            self._running = False
+            self.wait()
+
+
+    class WirelessStreamWorker(QThread):
+        """Receives the UDP EMG+IMU packet stream from a wireless BioWave device."""
+        batch_received = pyqtSignal(object)
+        error_occurred = pyqtSignal(str)
+
+        def __init__(self, port=WIFI_STREAM_PORT):
+            super().__init__()
+            self.port = int(port)
+            self._running = True
+            self._sock = None
+            self._fallback_packet_sequence = 0
+            self.stats = WirelessStats()
+
+        def _decode_frames(self, payload, count):
+            rows, frame_ids, frame_ts, imu_ids, imu_ts = [], [], [], [], []
+            for offset in range(0, count * WIRELESS_FRAME_SIZE, WIRELESS_FRAME_SIZE):
+                frame = payload[offset: offset + WIRELESS_FRAME_SIZE]
+                frame_id, emg_ts, imu_id, imu_ts_value, *frame_fields = struct.unpack(WIRELESS_FRAME_FORMAT, frame)
+                row = [float(v) for v in frame_fields[:WIRELESS_EMG_CHANNELS]]
+                row.extend([float(frame_fields[8]), float(frame_fields[9]), float(frame_fields[10])])
+                rows.append(row)
+                frame_ids.append(frame_id); frame_ts.append(emg_ts)
+                imu_ids.append(imu_id); imu_ts.append(imu_ts_value)
+            return rows, frame_ids, frame_ts, imu_ids, imu_ts
+
+        def _parse_datagram(self, data):
+            if len(data) == WIRELESS_PACKET_SIZE:
+                magic, version, frame_count, frame_size, packet_sequence = struct.unpack(
+                    WIFI_PACKET_HEADER_FORMAT, data[:WIFI_PACKET_HEADER_SIZE]
+                )
+                if magic != b"BWIM" or version != 1 or frame_size != WIRELESS_FRAME_SIZE or frame_count != WIRELESS_FRAMES_PER_PACKET:
+                    self.stats.invalid_packets += 1
+                    return None
+                payload = data[WIFI_PACKET_HEADER_SIZE:]
+                rows, frame_ids, frame_ts, imu_ids, imu_ts = self._decode_frames(payload, WIRELESS_FRAMES_PER_PACKET)
+                batch = np.asarray(rows, dtype=np.float32)
+                packet_numbers = np.full(batch.shape[0], int(packet_sequence), dtype=np.int64)
+                arrival = time.monotonic()
+                return SampleBatch(batch, packet_numbers, np.asarray(frame_ids), np.asarray(frame_ts),
+                                   np.asarray(imu_ids), np.asarray(imu_ts), arrival,
+                                   gap_before=self.stats.observe(packet_sequence, arrival))
+
+            if len(data) == (WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET):
+                rows, frame_ids, frame_ts, imu_ids, imu_ts = self._decode_frames(data, WIRELESS_FRAMES_PER_PACKET)
+                batch = np.asarray(rows, dtype=np.float32)
+                packet_no = int(self._fallback_packet_sequence)
+                self._fallback_packet_sequence += 1
+                packet_numbers = np.full(batch.shape[0], packet_no, dtype=np.int64)
+                return SampleBatch(batch, packet_numbers, np.asarray(frame_ids), np.asarray(frame_ts),
+                                   np.asarray(imu_ids), np.asarray(imu_ts), time.monotonic())
+
+            if len(data) == WIRELESS_FRAME_SIZE:
+                rows, frame_ids, frame_ts, imu_ids, imu_ts = self._decode_frames(data, 1)
+                batch = np.asarray(rows, dtype=np.float32)
+                packet_no = int(self._fallback_packet_sequence)
+                self._fallback_packet_sequence += 1
+                packet_numbers = np.full(batch.shape[0], packet_no, dtype=np.int64)
+                return SampleBatch(batch, packet_numbers, np.asarray(frame_ids), np.asarray(frame_ts),
+                                   np.asarray(imu_ids), np.asarray(imu_ts), time.monotonic())
+
+            return None
+
+        def run(self):
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("0.0.0.0", self.port))
+            self._sock.settimeout(1.0)
+            try:
+                while self._running:
+                    try:
+                        data, _addr = self._sock.recvfrom(2048)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    payload = self._parse_datagram(data)
+                    if payload is None:
+                        continue
+                    batch = np.asarray(payload.samples, dtype=np.float32)
+                    if batch.size > 0:
+                        self.batch_received.emit(payload)
+            except Exception as exc:
+                if self._running:
+                    self.error_occurred.emit(f"Wireless stream error: {exc}")
+            finally:
+                try:
+                    if self._sock is not None:
+                        self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+
+        def stop(self):
+            self._running = False
+            try:
+                if self._sock is not None:
+                    self._sock.close()
+            except Exception:
+                pass
+            self.wait()
+
+
+    class InferenceWorker(QThread):
+        """Extracts features and runs the pretrained Random Forest prediction."""
+        # label, confidence (None if unavailable), top-1/top-2 margin, inference ms
+        prediction_ready = pyqtSignal(str, object, object, float)
+        inference_error = pyqtSignal(str)
+
+        def __init__(self, sample_rate):
+            super().__init__()
+            self.sample_rate = int(sample_rate)
+            self.model = None
+            self.class_names = []
+            self._window = None
+            self._running = True
+            self._lock = threading.Lock()
+            self._event = threading.Event()
+
+        def load_model(self, model, class_names, sample_rate=None):
+            with self._lock:
+                self.model = model
+                self.class_names = [str(x) for x in list(class_names or [])]
+                if sample_rate is not None:
+                    self.sample_rate = int(max(1, sample_rate))
+                self._window = None
+            self._event.clear()
+
+        def clear_model(self):
+            with self._lock:
+                self.model = None
+                self.class_names = []
+                self._window = None
+            self._event.clear()
+
+        def submit_window(self, window):
+            with self._lock:
+                self._window = window
+            self._event.set()
+
+        def run(self):
+            while self._running:
+                self._event.wait(0.1)
+                if not self._running:
+                    break
+                if not self._event.is_set():
+                    continue
+                self._event.clear()
+
+                with self._lock:
+                    win = self._window
+                    model = self.model
+                    classes = list(self.class_names)
+                    self._window = None
+
+                if win is None or model is None or not HAS_RF_FEATURES:
+                    continue
+
+                try:
+                    started = time.monotonic()
+                    feats = extract_window_features(win, sample_rate=self.sample_rate).reshape(1, -1)
+                    pred_label = "N/A"
+                    conf = None
+                    margin = None
+
+                    if hasattr(model, "predict_proba"):
+                        proba = model.predict_proba(feats)[0]
+                        confidences = np.zeros(len(classes), dtype=np.float32)
+                        model_classes = list(getattr(model, "classes_", []))
+                        if len(model_classes) == len(proba) and len(classes) > 0:
+                            for i, cls_id in enumerate(model_classes):
+                                idx = -1
+                                try:
+                                    idx = int(cls_id)
+                                except Exception:
+                                    cls_text = str(cls_id)
+                                    if cls_text in classes:
+                                        idx = classes.index(cls_text)
+                                if 0 <= idx < len(confidences):
+                                    confidences[idx] = float(proba[i])
+                            pred_idx = int(np.argmax(confidences)) if np.max(confidences) > 0 else int(np.argmax(proba))
+                            pred_label = classes[pred_idx] if 0 <= pred_idx < len(classes) else str(model_classes[int(np.argmax(proba))])
+                            conf = float(np.max(confidences)) if np.max(confidences) > 0 else float(np.max(proba))
+                            sorted_p = np.sort(proba)
+                            margin = float(sorted_p[-1] - sorted_p[-2]) if len(sorted_p) > 1 else float(sorted_p[-1])
+                        else:
+                            pred_idx = int(np.argmax(proba))
+                            pred_label = classes[pred_idx] if 0 <= pred_idx < len(classes) else str(pred_idx)
+                            conf = float(proba[pred_idx])
+                            sorted_p = np.sort(proba)
+                            margin = float(sorted_p[-1] - sorted_p[-2]) if len(sorted_p) > 1 else float(sorted_p[-1])
+                    else:
+                        pred_raw = model.predict(feats)[0]
+                        if isinstance(pred_raw, (int, np.integer)) and 0 <= int(pred_raw) < len(classes):
+                            pred_label = classes[int(pred_raw)]
+                        else:
+                            pred_label = str(pred_raw)
+                        # A classifier without probabilities does not provide a confidence.
+                        # Safety gating consequently holds it in UNKNOWN rather than inventing 100%.
+                        conf = None
+
+                    self.prediction_ready.emit(pred_label, conf, margin, (time.monotonic() - started) * 1000.0)
+                except Exception as e:
+                    LOG.exception("Inference error")
+                    self.inference_error.emit(str(e))
+
+        def stop(self):
+            self._running = False
+            self._event.set()
+            self.wait()
+
+
+    class ProvisionDialog(QDialog):
+        """One-off USB step: hand Wi-Fi credentials to a fresh ESP32 device."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Provision Wireless Device (USB)")
+            self.resize(480, 300)
+            self.setModal(True)
+
+            layout = QVBoxLayout(self)
+            intro = QLabel("Connect the ESP32 over USB, pick its port, then send your Wi-Fi credentials.")
+            intro.setWordWrap(True)
+            layout.addWidget(intro)
+
+            port_row = QHBoxLayout()
+            port_row.addWidget(QLabel("USB Port:"))
+            self.combo_port = QComboBox()
+            port_row.addWidget(self.combo_port, 1)
+            btn_refresh = QPushButton("Refresh")
+            btn_refresh.clicked.connect(self.refresh_ports)
+            port_row.addWidget(btn_refresh)
+            layout.addLayout(port_row)
+
+            btn_info = QPushButton("Query Device Info")
+            btn_info.clicked.connect(self.query_info)
+            layout.addWidget(btn_info)
+
+            self.lbl_info = QLabel("No device queried yet.")
+            self.lbl_info.setWordWrap(True)
+            layout.addWidget(self.lbl_info)
+
+            form = QFormLayout()
+            self.txt_ssid = QLineEdit()
+            form.addRow("Wi-Fi SSID:", self.txt_ssid)
+            self.txt_password = QLineEdit()
+            self.txt_password.setEchoMode(QLineEdit.Password)
+            form.addRow("Wi-Fi Password:", self.txt_password)
+            layout.addLayout(form)
+
+            btn_row = QHBoxLayout()
+            self.btn_send = QPushButton("Send Credentials")
+            self.btn_send.clicked.connect(self.send_credentials)
+            btn_row.addWidget(self.btn_send)
+            btn_close = QPushButton("Close")
+            btn_close.clicked.connect(self.accept)
+            btn_row.addWidget(btn_close)
+            layout.addLayout(btn_row)
+
+            self.refresh_ports()
+
+        def refresh_ports(self):
+            self.combo_port.clear()
+            for p in WiFiSerialProvisionProtocol.available_ports():
+                self.combo_port.addItem(f"{p.device} - {p.description}", p.device)
+
+        def _selected_port(self):
+            data = self.combo_port.currentData()
+            if data:
+                return data
+            text = self.combo_port.currentText()
+            return text.split()[0] if text else ""
+
+        def query_info(self):
+            port = self._selected_port()
+            if not port:
+                QMessageBox.warning(self, "No Port", "Select a USB port first.")
+                return
+            try:
+                info = WiFiSerialProvisionProtocol.query_info(port)
+                self.lbl_info.setText(
+                    f"{info.device_name} | FW={info.firmware} | IMU ready={info.imu_ready} | Wi-Fi saved={info.wifi_saved}"
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Query Failed", str(e))
+
+        def send_credentials(self):
+            port = self._selected_port()
+            ssid = self.txt_ssid.text().strip()
+            password = self.txt_password.text()
+            if not port or not ssid:
+                QMessageBox.warning(self, "Missing Info", "Select a port and enter an SSID.")
+                return
+            try:
+                WiFiSerialProvisionProtocol.provision(port, ssid, password)
+                QMessageBox.information(self, "Provisioned", "Wi-Fi credentials sent. The device will reboot onto your network.")
+            except Exception as e:
+                QMessageBox.critical(self, "Provisioning Failed", str(e))
+
+
+    class CalibrationDialog(QDialog):
+        """Guides the user through a REST -> FLEX capture used to zero the baseline."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Calibration")
+            self.resize(420, 220)
+            self.setModal(True)
+            self.setWindowFlag(Qt.WindowCloseButtonHint, False)
+
+            layout = QVBoxLayout(self)
+            self.lbl_phase = QLabel("REST")
+            self.lbl_phase.setAlignment(Qt.AlignCenter)
+            f = QFont()
+            f.setPointSize(22)
+            f.setBold(True)
+            self.lbl_phase.setFont(f)
+            layout.addWidget(self.lbl_phase)
+
+            self.lbl_instruction = QLabel("")
+            self.lbl_instruction.setWordWrap(True)
+            self.lbl_instruction.setAlignment(Qt.AlignCenter)
+            layout.addWidget(self.lbl_instruction)
+
+            self.lbl_countdown = QLabel("")
+            self.lbl_countdown.setAlignment(Qt.AlignCenter)
+            cf = QFont()
+            cf.setPointSize(16)
+            self.lbl_countdown.setFont(cf)
+            layout.addWidget(self.lbl_countdown)
+
+            self.btn_cancel = QPushButton("Cancel")
+            layout.addWidget(self.btn_cancel)
+
+        def set_phase(self, name, instruction, remaining_ms, total_ms):
+            self.lbl_phase.setText(name)
+            self.lbl_instruction.setText(instruction)
+            self.lbl_countdown.setText(f"{max(0, remaining_ms) / 1000.0:0.1f}s remaining")
+
+        def set_finished(self, summary):
+            self.lbl_phase.setText("Done")
+            self.lbl_instruction.setText(summary)
+            self.lbl_countdown.setText("")
+            self.btn_cancel.setText("Close")
+
+
+
+    class HoldButton(QPushButton):
+        """Button that calls ``on_tick`` every 100 ms while it is held down (on-screen jog pad)."""
+
+        def __init__(self, text, on_tick, on_release=None, parent=None):
+            super().__init__(text, parent)
+            self._tick, self._release = on_tick, on_release
+            self._timer = QTimer(self)
+            self._timer.setInterval(100)
+            self._timer.timeout.connect(self._tick)
+            self.pressed.connect(self._start)
+            self.released.connect(self._stop)
+
+        def _start(self):
+            self._tick()
+            self._timer.start()
+
+        def _stop(self):
+            self._timer.stop()
+            if self._release:
+                self._release()
+
+
+    class ViewWidget(QLabel):
+        """The MuJoCo scene, rendered off-screen (SceneRenderer) and shown in a QLabel.
+
+        drag = orbit, right-drag / shift-drag = pan, wheel = zoom, double-click = reset view.
+        Frames are only rendered while the widget is visible, at most ``max_mpix`` megapixels (cooler on a fanless Air).
+        """
+
+        def __init__(self, backend, max_mpix: float = 0.70, shadows: bool = True):
+            super().__init__()
+            self.backend, self.max_mpix, self.shadows, self.frames = backend, max_mpix, shadows, False
+            self.renderer = None
+            self.error = ""
+            self.ms = 0.0                                   # EMA of render time (ms)
+            self._last = None
+            self.setMinimumSize(360, 250)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.setAlignment(Qt.AlignCenter)
+            self.setStyleSheet(f"background:{THEME_COLORS['graph_bg']}; border-radius: 6px; color:{THEME_COLORS['muted']};")
+            if getattr(backend, "model", None) is None:
+                self.error = "3D view needs the MuJoCo physics backend (pip install mujoco)."
+                self.setText(self.error)
+
+        # ---- options
+        def set_frames(self, on: bool) -> None:
+            self.frames = bool(on)
+            if self.renderer:
+                self.renderer.set_frames(self.frames)
+
+        def set_shadows(self, on: bool) -> None:
+            self.shadows = bool(on)
+            if self.renderer:
+                self.renderer.shadows = self.shadows
+
+        def reset_view(self) -> None:
+            if self.renderer:
+                self.renderer.reset_view()
+
+        # ---- rendering
+        def _target_size(self):
+            w, h = max(64, self.width()), max(64, self.height())
+            k = min(1.0, math.sqrt(self.max_mpix * 1e6 / (w * h)))
+            return int(w * k) // 2 * 2, int(h * k) // 2 * 2
+
+        def render_frame(self) -> None:
+            if self.error or not self.isVisible() or getattr(self.backend, "model", None) is None:
+                return
+            try:
+                tw, th = self._target_size()
+                if self.renderer is None:
+                    self.renderer = SceneRenderer(self.backend, tw, th, self.shadows)
+                    self.renderer.set_frames(self.frames)
+                elif abs(tw - self.renderer.size[0]) > 16 or abs(th - self.renderer.size[1]) > 16:
+                    self.renderer.resize(tw, th)
+                t0 = time.perf_counter()
+                img = self.renderer.render()
+                h, w = img.shape[:2]
+                qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888)
+                self._last = QPixmap.fromImage(qimg)
+                self.setPixmap(self._last.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self.ms = 0.9 * self.ms + 0.1 * (time.perf_counter() - t0) * 1000.0 if self.ms else (time.perf_counter() - t0) * 1000.0
+            except Exception as exc:                        # no OpenGL context etc.: keep the simulator running
+                self.error = f"3D view unavailable: {exc}"
+                self.setText(self.error)
+                LOG.error(self.error)
+
+        # ---- mouse
+        def mousePressEvent(self, e):
+            self._p = e.pos()
+            self._pan = bool(e.buttons() & (Qt.RightButton | Qt.MiddleButton)) or bool(e.modifiers() & Qt.ShiftModifier)
+
+        def mouseMoveEvent(self, e):
+            if not self.renderer or not hasattr(self, "_p"):
+                return
+            d = e.pos() - self._p
+            self._p = e.pos()
+            (self.renderer.pan if self._pan else self.renderer.orbit)(d.x(), d.y())
+
+        def wheelEvent(self, e):
+            if self.renderer:
+                self.renderer.zoom(e.angleDelta().y() / 120.0)
+
+        def mouseDoubleClickEvent(self, e):
+            self.reset_view()
+
+        def close_renderer(self) -> None:
+            if self.renderer:
+                self.renderer.close()
+                self.renderer = None
+
+
+    class ArmDashboard(QMainWindow):
+        """BioWave-style control centre for the simulated arm.
+
+        connect device -> load model -> calibrate -> map gestures to arm actions -> enable arm control,
+        with live EMG, prediction, signal-quality and arm telemetry on one screen.
+        """
+
+        PILL_OFF = f"background:{THEME_COLORS['title_bar']}; color:{THEME_COLORS['muted']};"
+        PILL_OK = f"background:{THEME_COLORS['accent']}; color:{THEME_COLORS['text']};"
+        PILL_BAD = f"background:{THEME_COLORS['special']}; color:{THEME_COLORS['text']};"
+        PILL_WARN = "background:#f57c00; color:#ffffff;"
+
+        def __init__(self, runtime: "SimulationRuntime", fps: float = 30.0, max_mpix: float = 0.70,
+                     shadows: bool = True, frames: bool = False):
+            super().__init__()
+            self.rt = runtime
+            self.view_fps, self.view_max_mpix, self.view_shadows, self.view_frames = fps, max_mpix, shadows, frames
+            self.setWindowTitle("BioWave - Robotic Arm Control Centre")
+            self.setMinimumSize(980, 620)
+            screen = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
+            w, h = (1360, 860) if screen is None else (min(1360, int(screen.width() * .96)), min(860, int(screen.height() * .94)))
+            self.resize(w, h)
+            self.setStyleSheet(app_stylesheet(12))
+            apply_dark_title_bar(self)
+            self._settings = QSettings("BioWave", "RoboticArm")
+
+            # ---- connection / stream state
+            self.worker = None
+            self.connection_medium = ""
+            self.is_connected = False
+            self.current_device = None
+            self.discovered_devices = []
+            self.wireless_access_key = DEFAULT_DEVICE_ACCESS_KEY
+            self.num_channels = WIRELESS_TOTAL_CHANNELS
+            self.emg_channel_count = WIRELESS_EMG_CHANNELS
+            self.keepalive_failures = 0
+            self.last_batch_received_monotonic = 0.0
+            self.stream_invalid_until = 0.0
+            # ---- model state
+            self.model_loaded = False
+            self.rf_class_names = []
+            self.rf_window_samples = 100
+            self.rf_stride_samples = 25
+            self.rf_model_input_channels = WIRELESS_TOTAL_CHANNELS
+            self.rf_model_sample_rate = SAMPLE_RATE
+            self.rf_preprocessing_version = LEGACY_PREPROCESSING_VERSION
+            self.model_compatible = False
+            self.model_compatibility_message = "No model loaded."
+            self.model_expected_feature_count = None
+            # ---- calibration state
+            self.is_calibrated = False
+            self.calibration_active = False
+            self.calibration_dialog = None
+            self.cal_rest_seconds, self.cal_flex_seconds = CAL_REST_MS // 1000, CAL_FLEX_MS // 1000
+            self.calibration_phases, self.current_cal_phase_idx = [], -1
+            self.current_phase_key, self.current_phase_remaining_ms, self.current_phase_total_ms = "", 0, 0
+            self.rest_capture, self.flex_capture = [], []
+            self.baseline_offsets = np.zeros(1, dtype=np.float32)
+            self.calibration_profile = None
+            self.preprocessor = None
+            self.calibration_timer = QTimer(self)
+            self.calibration_timer.timeout.connect(self.on_calibration_tick)
+            # ---- streaming buffers
+            self.sample_ring = None
+            self.profiler = StageProfiler()
+            self._buffer_lock = threading.RLock()
+            self.rf_valid_sample_count = 0
+            self.rf_samples_since_submit = 0
+            self.last_signal_quality = None
+            self.plot_buf = np.zeros((WIRELESS_EMG_CHANNELS, PLOT_SAMPLES), dtype=np.float32)
+            self.plot_filled = 0
+            self.packets_in_last_second, self._rate_t, self._rate_n, self.sample_rate_measured = 0, time.monotonic(), 0, 0.0
+            # ---- arm control
+            self.bridge = EMGArmBridge(self.rt.controller.submit, self.rt.controller.set_emg_status,
+                                       speed_m_s=EMG_SPEED_M_S)
+            self.mapping_combos = {}
+            # ---- keyboard (same keys as before, now handled by this window)
+            self.kb = KeyboardController(self.send, self.rt.mode, None, demo=self.rt.start_demo)
+            self._held, self._trig = set(), set()
+
+            self.init_ui()
+
+            self.inference_worker = InferenceWorker(SAMPLE_RATE)
+            self.inference_worker.prediction_ready.connect(self.on_prediction_ready)
+            self.inference_worker.inference_error.connect(self.on_inference_error)
+            self.inference_worker.start()
+
+            self.keepalive_timer = QTimer(self)
+            self.keepalive_timer.timeout.connect(self.send_wireless_keepalive)
+            self.keepalive_timer.start(KEEPALIVE_INTERVAL_MS)
+            self.ui_timer = QTimer(self)                    # 15 Hz: arm telemetry, stream watchdog, plot
+            self.ui_timer.timeout.connect(self.refresh_ui)
+            self.ui_timer.start(66)
+            self.render_timer = QTimer(self)                # 3D view
+            self.render_timer.timeout.connect(self.view.render_frame)
+            self.render_timer.start(int(1000 / max(1.0, self.view_fps)))
+            self.key_timer = QTimer(self)                   # 30 Hz: held keys -> jog commands
+            self.key_timer.timeout.connect(self.poll_keys)
+            self.key_timer.start(33)
+            QApplication.instance().installEventFilter(self)
+
+        # ================================================================== UI construction
+        def _group(self, title):
+            g = QGroupBox(title)
+            lay = QVBoxLayout(g)
+            lay.setSpacing(8)
+            return g, lay
+
+        def _pill(self, text="-"):
+            lbl = QLabel(text)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setMinimumWidth(100)
+            lbl.setStyleSheet(self.PILL_OFF + " border-radius: 11px; padding: 3px 8px; font-weight: 600;")
+            return lbl
+
+        @staticmethod
+        def _pred_style(color):
+            return f"color: {color}; font-size: 24px; font-weight: 700;"
+
+        def _set_pill(self, pill, text, style):
+            pill.setText(text)
+            pill.setStyleSheet(style + " border-radius: 11px; padding: 3px 8px; font-weight: 600;")
+
+        def init_ui(self):
+            central = QWidget()
+            root = QVBoxLayout(central)
+            root.setSpacing(10)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(central)
+            self.setCentralWidget(scroll)
+
+            # ---- status strip
+            strip = QHBoxLayout()
+            title = QLabel("BioWave  |  6-DOF Robotic Arm")
+            title.setStyleSheet("font-size: 16px; font-weight: 700;")
+            strip.addWidget(title)
+            strip.addStretch(1)
+            self.pill_device, self.pill_model = self._pill("Device: off"), self._pill("Model: none")
+            self.pill_cal, self.pill_control = self._pill("Calibration: no"), self._pill("Arm control: OFF")
+            self.pill_arm = self._pill("Arm: ready")
+            for p in (self.pill_device, self.pill_model, self.pill_cal, self.pill_control, self.pill_arm):
+                strip.addWidget(p)
+            root.addLayout(strip)
+
+            body = QHBoxLayout()
+            body.setSpacing(14)
+            left, middle, right = QVBoxLayout(), QVBoxLayout(), QVBoxLayout()
+            for c in (left, middle, right):
+                c.setSpacing(10)
+            body.addLayout(left, 4)
+            body.addLayout(middle, 6)
+            body.addLayout(right, 4)
+            root.addLayout(body, 1)
+
+            # ============ LEFT: setup (connect -> model -> calibrate)
+            g, lay = self._group("1  Connect Device")
+            self.tabs = QTabWidget()
+            self.tabs.addTab(self._build_wireless_tab(), "Wireless (Wi-Fi)")
+            self.tabs.addTab(self._build_wired_tab(), "Wired (USB / Serial)")
+            lay.addWidget(self.tabs)
+            self.lbl_conn_status = QLabel("Status: Disconnected")
+            self.lbl_conn_status.setAlignment(Qt.AlignCenter)
+            lay.addWidget(self.lbl_conn_status)
+            left.addWidget(g)
+
+            g, lay = self._group("2  Load Pretrained Model")
+            row = QHBoxLayout()
+            self.txt_model_path = QLineEdit()
+            self.txt_model_path.setReadOnly(True)
+            self.txt_model_path.setPlaceholderText("rf_realtime_model.joblib")
+            row.addWidget(self.txt_model_path, 1)
+            btn = QPushButton("Browse .joblib")
+            btn.clicked.connect(self.browse_model)
+            row.addWidget(btn)
+            lay.addLayout(row)
+            self.lbl_model_info = QLabel("No model loaded.")
+            self.lbl_model_info.setWordWrap(True)
+            self.lbl_model_info.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(self.lbl_model_info)
+            left.addWidget(g)
+
+            g, lay = self._group("3  Calibrate")
+            form = QFormLayout()
+            self.spin_rest_sec, self.spin_flex_sec = QSpinBox(), QSpinBox()
+            for sp, val, lab in ((self.spin_rest_sec, self.cal_rest_seconds, "Rest duration:"),
+                                 (self.spin_flex_sec, self.cal_flex_seconds, "Flex duration:")):
+                sp.setRange(CAL_DURATION_MIN_S, CAL_DURATION_MAX_S)
+                sp.setValue(val)
+                sp.setSuffix(" sec")
+                form.addRow(lab, sp)
+            lay.addLayout(form)
+            self.btn_calibrate = QPushButton("Calibrate")
+            self.btn_calibrate.setEnabled(False)
+            self.btn_calibrate.clicked.connect(self.start_calibration_sequence)
+            lay.addWidget(self.btn_calibrate)
+            self.lbl_cal_status = QLabel("Connect a device and load a model to calibrate.")
+            self.lbl_cal_status.setWordWrap(True)
+            self.lbl_cal_status.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(self.lbl_cal_status)
+            left.addWidget(g)
+
+            g, lay = self._group("Gesture to Arm-Action Mapping")
+            self.scroll_map = QScrollArea()
+            self.scroll_map.setWidgetResizable(True)
+            self.scroll_map.setMinimumHeight(120)
+            self.map_content = QWidget()
+            self.map_form = QFormLayout(self.map_content)
+            self.scroll_map.setWidget(self.map_content)
+            lay.addWidget(self.scroll_map)
+            self.lbl_map_hint = QLabel("Load a model to see its gestures.")
+            self.lbl_map_hint.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            self.map_form.addRow(self.lbl_map_hint)
+            left.addWidget(g, 1)
+
+            # ============ MIDDLE: 3D view + live gesture + EMG
+            g, lay = self._group("3D View")
+            g.setToolTip("drag: orbit   |   right-drag or shift-drag: pan   |   wheel: zoom   |   double-click: reset view")
+            self.view = ViewWidget(self.rt.backend, self.view_max_mpix, self.view_shadows)
+            self.view.frames = self.view_frames
+            lay.addWidget(self.view, 1)
+            row = QHBoxLayout()
+            self.chk_frames = QCheckBox("Link frames")
+            self.chk_frames.setChecked(self.view_frames)
+            self.chk_frames.toggled.connect(self.view.set_frames)
+            self.chk_shadows = QCheckBox("Shadows")
+            self.chk_shadows.setChecked(self.view_shadows)
+            self.chk_shadows.toggled.connect(self.view.set_shadows)
+            btn = QPushButton("Reset view")
+            btn.clicked.connect(self.view.reset_view)
+            self.lbl_fps = QLabel("")
+            self.lbl_fps.setToolTip("3D view: drag = orbit, right-drag = pan, wheel = zoom, double-click = reset")
+            self.lbl_fps.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            for w_ in (self.chk_frames, self.chk_shadows, btn):
+                row.addWidget(w_)
+            row.addStretch(1)
+            row.addWidget(self.lbl_fps)
+            lay.addLayout(row)
+            middle.addWidget(g, 5)
+
+            g, lay = self._group("Live Gesture")
+            row = QHBoxLayout()
+            self.lbl_prediction = QLabel("REST")
+            self.lbl_prediction.setMinimumWidth(170)
+            self.lbl_prediction.setStyleSheet(self._pred_style(THEME_COLORS['disabled']))
+            row.addWidget(self.lbl_prediction)
+            col = QVBoxLayout()
+            self.bar_conf = QProgressBar()
+            self.bar_conf.setRange(0, 100)
+            self.bar_conf.setTextVisible(False)
+            col.addWidget(self.bar_conf)
+            self.lbl_action = QLabel("Arm action: -")
+            col.addWidget(self.lbl_action)
+            row.addLayout(col, 1)
+            lay.addLayout(row)
+            self.lbl_diagnostics = QLabel("Signal: WAITING | Calibration: NOT VALID | Packet loss: n/a")
+            self.lbl_diagnostics.setWordWrap(True)
+            self.lbl_diagnostics.setAlignment(Qt.AlignCenter)
+            self.lbl_diagnostics.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(self.lbl_diagnostics)
+            self.btn_control = QPushButton("ENABLE ARM CONTROL")
+            self.btn_control.setCheckable(True)
+            self.btn_control.setEnabled(False)
+            self.btn_control.setStyleSheet("background-color: #2e7d32; font-size: 16px; padding: 10px;")
+            self.btn_control.toggled.connect(self.toggle_arm_control)
+            lay.addWidget(self.btn_control)
+            self.lbl_status = QLabel("Status: Idle")
+            self.lbl_status.setAlignment(Qt.AlignCenter)
+            self.lbl_status.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(self.lbl_status)
+            middle.addWidget(g)
+
+            g, lay = self._group("Live EMG (8 channels)")
+            self.plot = pg.PlotWidget()
+            self.plot.setBackground(THEME_COLORS["graph_bg"])
+            self.plot.setMinimumHeight(110)
+            self.plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)    # its huge sizeHint must not grow the window
+            self.plot.setMouseEnabled(False, False)
+            self.plot.hideButtons()
+            self.plot.showGrid(x=False, y=True, alpha=0.15)
+            self.plot.setYRange(-0.8, WIRELESS_EMG_CHANNELS - 0.2, padding=0)
+            self.plot.setXRange(0, PLOT_SAMPLES, padding=0)
+            for axis in ("left", "bottom"):
+                self.plot.getAxis(axis).setPen(pg.mkPen(THEME_COLORS["muted"]))
+                self.plot.getAxis(axis).setTextPen(pg.mkPen(THEME_COLORS["text"]))
+            self.plot.getAxis("left").setTicks([[(i, f"CH{i + 1}") for i in range(WIRELESS_EMG_CHANNELS)]])
+            self.plot.getAxis("bottom").setStyle(showValues=False)
+            self.curves = [self.plot.plot(pen=pg.mkPen(PLOT_COLORS[i % len(PLOT_COLORS)], width=1))
+                           for i in range(WIRELESS_EMG_CHANNELS)]
+            self._xs = np.arange(PLOT_SAMPLES)
+            lay.addWidget(self.plot)
+            self.lbl_stream = QLabel("No stream.")
+            self.lbl_stream.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(self.lbl_stream)
+            middle.addWidget(g, 2)
+
+            # ============ RIGHT: arm state, commands, jog / test / settings
+            g, lay = self._group("Arm State")
+            self.lbl_tcp = QLabel("X 0.0   Y 0.0   Z 0.0 mm")
+            self.lbl_tcp.setStyleSheet("font-size: 16px; font-weight: 600;")
+            lay.addWidget(self.lbl_tcp)
+            self.lbl_joints = QLabel("J1..J5: -")
+            self.lbl_joints.setWordWrap(True)
+            lay.addWidget(self.lbl_joints)
+            self.bar_gripper = QProgressBar()
+            self.bar_gripper.setRange(0, 100)
+            self.bar_gripper.setFormat("Gripper %p% open")
+            lay.addWidget(self.bar_gripper)
+            self.lbl_safety = QLabel("Safety: OK")
+            self.lbl_safety.setWordWrap(True)
+            lay.addWidget(self.lbl_safety)
+            self.lbl_loop = QLabel("")
+            self.lbl_loop.setWordWrap(True)
+            self.lbl_loop.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(self.lbl_loop)
+            right.addWidget(g)
+
+            g, lay = self._group("Arm Commands")
+            self.btn_estop = QPushButton("EMERGENCY STOP   (Esc)")
+            self.btn_estop.setStyleSheet(f"background-color: {THEME_COLORS['special']}; font-size: 16px; padding: 12px;")
+            self.btn_estop.clicked.connect(self.emergency_stop)
+            lay.addWidget(self.btn_estop)
+            grid = QGridLayout()
+            for i, (text, fn) in enumerate((("Home  (Z)", lambda: self.send(MotionCommand.home(source="dashboard"))),
+                                            ("Stop  (Space)", lambda: self.send(MotionCommand.stop(source="dashboard"))),
+                                            ("Reset after stop  (X)", lambda: self.send(MotionCommand(RESET, source="dashboard"))),
+                                            ("Pick && place  (P)", self.rt.start_demo),
+                                            ("Open gripper  (O)", lambda: self.send(MotionCommand.gripper("OPEN", source="dashboard"))),
+                                            ("Close gripper  (C)", lambda: self.send(MotionCommand.gripper("CLOSE", source="dashboard"))))):
+                b = QPushButton(text)
+                b.clicked.connect(fn)
+                grid.addWidget(b, i // 2, i % 2)
+            lay.addLayout(grid)
+            right.addWidget(g)
+
+            tabs = QTabWidget()
+            # -- manual jog
+            w_ = QWidget()
+            pad = QGridLayout(w_)
+            jog = {"Up +Z": ("UP", 0, 1), "Left -X": ("LEFT", 1, 0), "Right +X": ("RIGHT", 1, 2),
+                   "Down -Z": ("DOWN", 2, 1), "Fwd +Y": ("FORWARD", 0, 2), "Back -Y": ("BACKWARD", 2, 0)}
+            for text, (direction, r, c) in jog.items():
+                b = HoldButton(text, lambda d=direction: self.send(MotionCommand(
+                    CARTESIAN, d, speed=self.spin_speed_jog.value() / 1000.0, source="dashboard")),
+                    lambda: self.send(MotionCommand.hold(source="dashboard")))
+                pad.addWidget(b, r, c)
+            self.spin_speed_jog = QSpinBox()
+            self.spin_speed_jog.setRange(5, 120)
+            self.spin_speed_jog.setValue(60)
+            self.spin_speed_jog.setSuffix(" mm/s")
+            pad.addWidget(QLabel("Jog speed:"), 3, 0)
+            pad.addWidget(self.spin_speed_jog, 3, 1, 1, 2)
+            note = QLabel("Hold a button, or use the arrow keys / I / K (joints: Q A  W S  E D  R F  T G).")
+            note.setWordWrap(True)
+            note.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px;")
+            pad.addWidget(note, 4, 0, 1, 3)
+            tabs.addTab(w_, "Manual Jog")
+            # -- test without device
+            w_ = QWidget()
+            row = QGridLayout(w_)
+            for i, (text, gesture) in enumerate((("Left", "left"), ("Right", "right"), ("Up", "up"),
+                                                 ("Down", "down"), ("Fist", "fist_close"), ("Rest", "rest"))):
+                b = QPushButton(text)
+                b.pressed.connect(lambda g_=gesture: self.mock_gesture(g_))
+                b.released.connect(lambda: self.mock_gesture(None))
+                row.addWidget(b, i // 3, i % 3)
+            note = QLabel("Hold a button (or keys 1-5, 0): simulated gestures run through the same smoothing + mapping "
+                          "path as the armband.")
+            note.setWordWrap(True)
+            note.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px;")
+            row.addWidget(note, 2, 0, 1, 3)
+            tabs.addTab(w_, "Test Without Device")
+            # -- control settings
+            w_ = QWidget()
+            form = QFormLayout(w_)
+            eng = self.bridge.engine
+            self.spin_conf = QDoubleSpinBox()
+            self.spin_conf.setRange(10.0, 99.9)
+            self.spin_conf.setValue(GESTURE_MIN_CONFIDENCE_DEFAULT)
+            self.spin_conf.setSuffix("%")
+            self.spin_conf.valueChanged.connect(lambda v: setattr(self.bridge.engine, "min_confidence", v / 100.0))
+            eng.min_confidence = GESTURE_MIN_CONFIDENCE_DEFAULT / 100.0
+            form.addRow("Minimum Confidence:", self.spin_conf)
+            self.spin_margin = QDoubleSpinBox()
+            self.spin_margin.setRange(0.0, 50.0)
+            self.spin_margin.setValue(eng.min_margin * 100.0)
+            self.spin_margin.setSuffix(" pts")
+            self.spin_margin.setToolTip("Gap required between the top prediction and the runner-up. "
+                                        "Raise it if Rest keeps triggering moves.")
+            self.spin_margin.valueChanged.connect(lambda v: setattr(self.bridge.engine, "min_margin", v / 100.0))
+            form.addRow("Confidence Margin:", self.spin_margin)
+            self.spin_debounce = QSpinBox()
+            self.spin_debounce.setRange(1, 10)
+            self.spin_debounce.setValue(eng.consecutive_required)
+            self.spin_debounce.setSuffix(" frames")
+            self.spin_debounce.valueChanged.connect(lambda v: setattr(self.bridge.engine, "consecutive_required", v))
+            form.addRow("Debounce Count:", self.spin_debounce)
+            self.spin_speed = QSpinBox()
+            self.spin_speed.setRange(5, 120)
+            self.spin_speed.setValue(int(round(EMG_SPEED_M_S * 1000)))
+            self.spin_speed.setSuffix(" mm/s")
+            self.spin_speed.valueChanged.connect(lambda v: setattr(self.bridge, "speed", v / 1000.0))
+            form.addRow("EMG Arm Speed:", self.spin_speed)
+            self.spin_grip_refr = QDoubleSpinBox()
+            self.spin_grip_refr.setRange(0.1, 5.0)
+            self.spin_grip_refr.setValue(eng.refractory_s)
+            self.spin_grip_refr.setSuffix(" sec")
+            self.spin_grip_refr.valueChanged.connect(lambda v: setattr(self.bridge.engine, "refractory_s", v))
+            form.addRow("Gripper Cooldown:", self.spin_grip_refr)
+            tabs.addTab(w_, "Control Settings")
+            right.addWidget(tabs)
+            right.addStretch(1)
+
+            if not HAS_PYQTGRAPH:
+                self.lbl_stream.setText("pyqtgraph missing - live EMG plot disabled.")
+
+        def _build_wireless_tab(self):
+            w = QWidget()
+            lay = QVBoxLayout(w)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Access Key:"))
+            self.txt_access_key = QLineEdit(self.wireless_access_key)
+            self.txt_access_key.setEchoMode(QLineEdit.Password)
+            row.addWidget(self.txt_access_key, 1)
+            lay.addLayout(row)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Device:"))
+            self.combo_devices = QComboBox()
+            row.addWidget(self.combo_devices, 1)
+            btn = QPushButton("Discover")
+            btn.clicked.connect(self.discover_wireless_devices)
+            row.addWidget(btn)
+            lay.addLayout(row)
+            self.lbl_device_info = QLabel("No wireless device discovered yet. Make sure this computer is on the same Wi-Fi as the armband.")
+            self.lbl_device_info.setWordWrap(True)
+            self.lbl_device_info.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(self.lbl_device_info)
+            self.combo_devices.currentIndexChanged.connect(self._refresh_device_info)
+            btn = QPushButton("Provision New Device (USB)")
+            btn.clicked.connect(lambda: ProvisionDialog(self).exec_())
+            lay.addWidget(btn)
+            self.btn_wireless_connect = QPushButton("Connect Wireless")
+            self.btn_wireless_connect.clicked.connect(self.toggle_wireless_connection)
+            lay.addWidget(self.btn_wireless_connect)
+            return w
+
+        def _build_wired_tab(self):
+            w = QWidget()
+            lay = QVBoxLayout(w)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Port:"))
+            self.combo_ports = QComboBox()
+            row.addWidget(self.combo_ports, 1)
+            btn = QPushButton("Refresh")
+            btn.clicked.connect(self.refresh_wired_ports)
+            row.addWidget(btn)
+            lay.addLayout(row)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Channels (EMG + IMU):"))
+            self.spin_wired_channels = QSpinBox()
+            self.spin_wired_channels.setRange(2, WIRELESS_TOTAL_CHANNELS)
+            self.spin_wired_channels.setValue(WIRELESS_TOTAL_CHANNELS)
+            row.addWidget(self.spin_wired_channels)
+            row.addStretch()
+            lay.addLayout(row)
+            self.btn_wired_connect = QPushButton("Connect")
+            self.btn_wired_connect.clicked.connect(self.toggle_wired_connection)
+            lay.addWidget(self.btn_wired_connect)
+            self.refresh_wired_ports()
+            return w
+
+        # ================================================================== keyboard
+        @staticmethod
+        def _key_name(ev):
+            special = {Qt.Key_Left: "left", Qt.Key_Right: "right", Qt.Key_Up: "up", Qt.Key_Down: "down",
+                       Qt.Key_Escape: "esc", Qt.Key_Space: " "}
+            if ev.key() in special:
+                return special[ev.key()]
+            t = ev.text().lower()
+            return t if len(t) == 1 and t.isprintable() else None
+
+        def eventFilter(self, obj, ev):
+            if ev.type() not in (QEvent.KeyPress, QEvent.KeyRelease) or not self.isActiveWindow() or ev.isAutoRepeat():
+                return False
+            if isinstance(QApplication.focusWidget(), (QLineEdit, QAbstractSpinBox)):
+                return False                                # typing in a text box / spin box: not a robot key
+            name = self._key_name(ev)
+            if name is None or ev.modifiers() & (Qt.ControlModifier | Qt.MetaModifier | Qt.AltModifier):
+                return False
+            gesture = KEY_TO_GESTURE.get(name) if self.rt.mode in ("emg", "full") else None
+            known = name in KEY_TO_GESTURE or name in JOINT_KEYS or name in CARTESIAN_KEYS or name in ("esc", " ", "o", "c", "z", "x", "p")
+            if not known:
+                return False
+            if ev.type() == QEvent.KeyPress:
+                self._held.add(name)
+                self._trig.add(name)
+                if gesture:
+                    self.mock_gesture(gesture)
+            else:
+                self._held.discard(name)
+                if gesture and not any(k in KEY_TO_GESTURE for k in self._held):
+                    self.mock_gesture(None)
+            return True
+
+        def poll_keys(self):
+            if not self.isActiveWindow():
+                if self._held:
+                    self._held.clear()
+                    self.mock_gesture(None)
+                return
+            trig, self._trig = self._trig, set()
+            self.kb.update({k for k in self._held if k not in KEY_TO_GESTURE}, {k for k in trig if k not in KEY_TO_GESTURE})
+
+        # ================================================================== helpers
+        def send(self, cmd) -> bool:
+            return self.rt.controller.submit(cmd)
+
+        def mock_gesture(self, gesture):
+            src = self.rt.kb_source
+            if src is None:
+                self.lbl_status.setText("Status: mock gestures need --mode full or emg")
+                return
+            src.set_gesture(gesture) if gesture else src.release()
+
+        def emergency_stop(self):
+            self.btn_control.setChecked(False)
+            self.send(MotionCommand(ESTOP, source="dashboard"))
+            self.lbl_status.setText("Status: EMERGENCY STOP - press 'Reset after stop' to continue")
+
+        # ================================================================== wired
+        def refresh_wired_ports(self):
+            self.combo_ports.clear()
+            self.combo_ports.addItem("socket://127.0.0.1:7000 (Simulator)", "socket://127.0.0.1:7000")
+            if HAS_SERIAL:
+                for p in serial.tools.list_ports.comports():
+                    self.combo_ports.addItem(f"{p.device} - {p.description}", p.device)
+
+        def toggle_wired_connection(self):
+            self.disconnect_stream() if self.is_connected else self.connect_wired()
+
+        def connect_wired(self):
+            if not HAS_SERIAL:
+                QMessageBox.warning(self, "Missing Library", "pyserial not found. Run: pip install pyserial")
+                return
+            port = self.combo_ports.currentData() or (self.combo_ports.currentText().split() or [""])[0]
+            if not port:
+                QMessageBox.warning(self, "No Port", "Please select a valid serial port.")
+                return
+            self.num_channels = int(self.spin_wired_channels.value())
+            self.emg_channel_count = min(WIRELESS_EMG_CHANNELS, self.num_channels)
+            self._reset_stream_state()
+            self.worker = SerialWorker(port, DEFAULT_BAUD_RATE, self.num_channels, batch_size=25)
+            self.worker.batch_received.connect(self.on_stream_batch)
+            self.worker.error_occurred.connect(self.on_stream_error)
+            self.worker.start()
+            self.connection_medium, self.is_connected = "wired", True
+            self.btn_wired_connect.setText("Disconnect")
+            self.btn_wireless_connect.setEnabled(False)
+            self._set_connected_text(f"Connected (wired, {self.num_channels} ch)")
+
+        # ================================================================== wireless
+        def discover_wireless_devices(self):
+            self.lbl_device_info.setText("Searching the network...")
+            QApplication.processEvents()
+            try:
+                self.discovered_devices = ControlProtocol.discover()
+            except Exception as exc:
+                QMessageBox.warning(self, "Discovery Failed", str(exc))
+                return
+            self.combo_devices.clear()
+            for d in self.discovered_devices:
+                self.combo_devices.addItem(d.summary, d)
+            if not self.discovered_devices:
+                self.lbl_device_info.setText("No BioWave wireless devices replied on the current Wi-Fi.")
+            self._refresh_device_info()
+
+        def _refresh_device_info(self):
+            d = self.combo_devices.currentData()
+            if isinstance(d, DeviceInfo):
+                self.lbl_device_info.setText(f"{d.device_name} | IP={d.ip} | Mode={d.wifi_mode} | FW={d.firmware} | IMU ready={d.imu_ready}")
+
+        def toggle_wireless_connection(self):
+            self.disconnect_stream() if self.is_connected else self.connect_wireless()
+
+        def connect_wireless(self):
+            device = self.combo_devices.currentData()
+            if not isinstance(device, DeviceInfo):
+                QMessageBox.warning(self, "No Device", "Discover and select a wireless device first.")
+                return
+            key = self.txt_access_key.text().strip()
+            if not key:
+                QMessageBox.warning(self, "Missing Access Key", "Enter the device access key before connecting.")
+                return
+            self.wireless_access_key = key
+            self.num_channels, self.emg_channel_count = WIRELESS_TOTAL_CHANNELS, WIRELESS_EMG_CHANNELS
+            self._reset_stream_state()
+            try:
+                self.worker = WirelessStreamWorker(WIFI_STREAM_PORT)
+                self.worker.batch_received.connect(self.on_stream_batch)
+                self.worker.error_occurred.connect(self.on_stream_error)
+                self.worker.start()
+                ControlProtocol.start_stream(device.ip, key, get_local_ip_for_target(device.ip), WIFI_STREAM_PORT)
+                self.current_device, self.connection_medium, self.is_connected = device, "wireless", True
+                self.keepalive_failures = 0
+                self.btn_wireless_connect.setText("Disconnect")
+                self.btn_wired_connect.setEnabled(False)
+                self._set_connected_text(f"Connected (wireless, {device.summary})")
+            except Exception as exc:
+                if self.worker:
+                    self.worker.stop()
+                    self.worker = None
+                QMessageBox.critical(self, "Wireless Connection Error", str(exc))
+
+        def _set_connected_text(self, text):
+            self.lbl_conn_status.setText("Status: " + text)
+            self.lbl_conn_status.setStyleSheet(f"color: {THEME_COLORS['accent']};")
+            self._set_pill(self.pill_device, "Device: streaming", self.PILL_OK)
+            self.check_ready_state()
+
+        def send_wireless_keepalive(self):
+            """Ping the ESP32 so its firmware does not time the stream out; flag the link if pings keep failing."""
+            if not (self.is_connected and self.connection_medium == "wireless" and self.current_device):
+                return
+            try:
+                ControlProtocol.ping(self.current_device.ip, self.wireless_access_key)
+                self.keepalive_failures = 0
+            except Exception:
+                self.keepalive_failures += 1
+                if self.keepalive_failures >= KEEPALIVE_MAX_FAILURES:
+                    self.lbl_conn_status.setText("Status: Wireless keepalive lost")
+                    self.lbl_conn_status.setStyleSheet("color: #f57c00;")
+                    self._set_pill(self.pill_device, "Device: link lost", self.PILL_BAD)
+                    self.disable_arm_control("Wireless connection lost")
+
+        def on_stream_error(self, message):
+            LOG.error("Stream error: %s", message)
+            self.disable_arm_control("Connection error")
+            QMessageBox.warning(self, "Stream Error", message)
+
+        def disconnect_stream(self):
+            self.stop_calibration_if_running()
+            if self.connection_medium == "wireless" and self.current_device and self.wireless_access_key:
+                try:
+                    ControlProtocol.stop_stream(self.current_device.ip, self.wireless_access_key)
+                except Exception:
+                    pass
+            if self.worker:
+                try:
+                    self.worker.batch_received.disconnect()
+                    self.worker.error_occurred.disconnect()
+                except Exception:
+                    pass
+                self.worker.stop()
+                self.worker = None
+            self.is_connected = self.is_calibrated = False
+            self.preprocessor = self.calibration_profile = self.current_device = None
+            self.connection_medium = ""
+            self.keepalive_failures = 0
+            self.disable_arm_control("Disconnected")
+            self.btn_wired_connect.setText("Connect")
+            self.btn_wired_connect.setEnabled(True)
+            self.btn_wireless_connect.setText("Connect Wireless")
+            self.btn_wireless_connect.setEnabled(True)
+            self.lbl_conn_status.setText("Status: Disconnected")
+            self.lbl_conn_status.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            self._set_pill(self.pill_device, "Device: off", self.PILL_OFF)
+            self.check_ready_state()
+
+        def _reset_stream_state(self):
+            with self._buffer_lock:
+                self.sample_ring = SampleRingBuffer(self.num_channels, WINDOW_SIZE)
+            self.baseline_offsets = np.zeros(self.num_channels, dtype=np.float32)
+            self.plot_buf[:] = 0
+            self.plot_filled = 0
+            self.rf_valid_sample_count = self.rf_samples_since_submit = 0
+            self.is_calibrated = self.calibration_active = False
+            self.rest_capture, self.flex_capture = [], []
+            self.last_batch_received_monotonic = 0.0
+
+        # ================================================================== model
+        def browse_model(self):
+            start = self._settings.value("model_dir", "") or str(DEFAULT_MODEL_DIR if DEFAULT_MODEL_DIR.exists() else Path.home())
+            path, _ = QFileDialog.getOpenFileName(self, "Select RF Model", start, "Joblib Files (*.joblib)")
+            if path:
+                self.load_model(path)
+
+        def load_model(self, path: str) -> bool:
+            try:
+                artifact = joblib.load(path)
+                model = artifact["model"]
+                names = list(artifact.get("class_names", artifact.get("classes", [])))
+                if not names and hasattr(model, "classes_"):
+                    names = [str(x) for x in model.classes_]
+                self.rf_window_samples = int(max(8, artifact.get("window_samples", 100)))
+                self.rf_stride_samples = int(max(1, artifact.get("stride_samples", self.rf_window_samples)))
+                self.rf_model_input_channels = int(max(1, artifact.get("input_channels", self.num_channels)))
+                self.rf_model_sample_rate = int(artifact.get("sample_rate", SAMPLE_RATE))
+                self.rf_class_names = [str(x) for x in names]
+                # "input_channels" is the trained total (8 EMG + 3 IMU = 11), so compare with num_channels.
+                comp = validate_model_artifact(artifact, SAMPLE_RATE, self.num_channels)
+                self.rf_preprocessing_version = comp.preprocessing_version
+                self.model_compatible = comp.compatible
+                self.model_compatibility_message = "\n".join(comp.errors + comp.warnings) or "Model compatibility verified."
+                self.model_expected_feature_count = getattr(model, "n_features_in_", None)
+                if not comp.compatible:
+                    raise ValueError("Model is incompatible:\n" + "\n".join(comp.errors))
+                self.inference_worker.load_model(model, self.rf_class_names, sample_rate=self.rf_model_sample_rate)
+                self.txt_model_path.setText(path)
+                self._settings.setValue("model_dir", str(Path(path).parent))
+                self.build_mapping_ui(self.rf_class_names)
+                self.model_loaded = True
+                self.lbl_model_info.setText(f"{len(self.rf_class_names)} gestures: {', '.join(self.rf_class_names)}\n"
+                                            f"window {self.rf_window_samples} samples, {self.rf_model_input_channels} input channels")
+                self._set_pill(self.pill_model, "Model: loaded", self.PILL_OK)
+                if comp.warnings:                  # legacy models lack metadata: note it, do not block with a dialog
+                    self.lbl_model_info.setText(self.lbl_model_info.text() + "\nNote: " + " ".join(comp.warnings))
+                self.check_ready_state()
+                return True
+            except Exception as exc:
+                self.model_loaded = False
+                self._set_pill(self.pill_model, "Model: error", self.PILL_BAD)
+                QMessageBox.critical(self, "Load Error", f"Failed to load model:\n{exc}")
+                return False
+
+        def build_mapping_ui(self, class_names):
+            while self.map_form.count():
+                item = self.map_form.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            self.mapping_combos = {}
+            self.bridge.set_mapping(class_names)
+            for cls in class_names:
+                combo = QComboBox()
+                combo.addItems(list(ARM_ACTIONS))
+                combo.setCurrentText(self.bridge.action_map[cls])
+                combo.currentTextChanged.connect(lambda text, c=cls: self.bridge.set_action(c, text))
+                self.map_form.addRow(f"Gesture: {cls}", combo)
+                self.mapping_combos[cls] = combo
+
+        def check_ready_state(self):
+            if self.model_loaded:
+                expected = self.model_expected_feature_count
+                if expected is not None and expected != expected_feature_count(self.num_channels):
+                    self.model_compatible = False
+                    self.model_compatibility_message = "Feature count does not match the connected device's channel count."
+                elif expected is not None:
+                    self.model_compatible = True
+                    self.model_compatibility_message = "Model feature count matches the connected device's channels."
+            ready = self.model_loaded and self.is_connected and self.model_compatible
+            self.btn_calibrate.setEnabled(ready and not self.calibration_active)
+            control_ready = ready and self.is_calibrated
+            self.btn_control.setEnabled(control_ready)
+            if not control_ready and self.btn_control.isChecked():
+                self.btn_control.setChecked(False)
+            if ready and not self.is_calibrated:
+                self.lbl_cal_status.setText("Ready to calibrate. Click Calibrate and follow the prompts.")
+            elif not ready:
+                self.lbl_cal_status.setText(self.model_compatibility_message if self.model_loaded and not self.model_compatible
+                                            else "Connect a device and load a model to calibrate.")
+            self._set_pill(self.pill_cal, "Calibration: valid" if self.is_calibrated else "Calibration: no",
+                           self.PILL_OK if self.is_calibrated else self.PILL_OFF)
+
+        # ================================================================== calibration
+        def start_calibration_sequence(self):
+            if not self.is_connected or self.calibration_active:
+                return
+            self.cal_rest_seconds, self.cal_flex_seconds = self.spin_rest_sec.value(), self.spin_flex_sec.value()
+            self.calibration_phases = [
+                {"key": "rest", "name": "REST", "duration_ms": self.cal_rest_seconds * 1000,
+                 "instruction": "Keep your arm fully relaxed. Do not move."},
+                {"key": "flex", "name": "FLEX", "duration_ms": self.cal_flex_seconds * 1000,
+                 "instruction": "Flex the target muscle steadily until this phase ends."},
+            ]
+            self.bridge.enable(False)
+            self.calibration_active, self.is_calibrated = True, False
+            self.rest_capture, self.flex_capture = [], []
+            self.current_cal_phase_idx = -1
+            self.rf_valid_sample_count = self.rf_samples_since_submit = 0
+            self.btn_calibrate.setEnabled(False)
+            self.lbl_cal_status.setText("Calibrating - follow the on-screen prompts.")
+            self.calibration_dialog = CalibrationDialog(self)
+            self.calibration_dialog.btn_cancel.clicked.connect(self.cancel_calibration_sequence)
+            self.calibration_dialog.show()
+            self.begin_next_calibration_phase()
+
+        def begin_next_calibration_phase(self):
+            self.current_cal_phase_idx += 1
+            if self.current_cal_phase_idx >= len(self.calibration_phases):
+                self.finish_calibration_sequence()
+                return
+            ph = self.calibration_phases[self.current_cal_phase_idx]
+            self.current_phase_key = ph["key"]
+            self.current_phase_total_ms = self.current_phase_remaining_ms = ph["duration_ms"]
+            if self.calibration_dialog:
+                self.calibration_dialog.set_phase(ph["name"], ph["instruction"], self.current_phase_remaining_ms, self.current_phase_total_ms)
+            self.calibration_timer.start(CAL_TICK_MS)
+
+        def on_calibration_tick(self):
+            if not self.calibration_active:
+                self.calibration_timer.stop()
+                return
+            self.current_phase_remaining_ms -= CAL_TICK_MS
+            ph = self.calibration_phases[self.current_cal_phase_idx]
+            if self.calibration_dialog:
+                self.calibration_dialog.set_phase(ph["name"], ph["instruction"], self.current_phase_remaining_ms, self.current_phase_total_ms)
+            if self.current_phase_remaining_ms <= 0:
+                self.calibration_timer.stop()
+                self.begin_next_calibration_phase()
+
+        def finish_calibration_sequence(self):
+            self.calibration_timer.stop()
+            self.calibration_active = False
+            self.current_phase_key = ""
+            if not self.rest_capture or not self.flex_capture:
+                self.lbl_cal_status.setText("Calibration failed: no samples captured.")
+                QMessageBox.warning(self, "Calibration Failed", "No REST/FLEX samples were captured. Is the stream running?")
+                self._close_calibration_dialog()
+                self.check_ready_state()
+                return
+            rest = np.vstack(self.rest_capture).astype(np.float32)
+            flex = np.vstack(self.flex_capture).astype(np.float32)
+            n_emg = int(min(self.emg_channel_count, rest.shape[1]))
+            try:
+                self.calibration_profile = compute_calibration(rest[:, :n_emg], flex[:, :n_emg])
+            except ValueError as exc:
+                self.lbl_cal_status.setText(f"Calibration failed: {exc}")
+                self._close_calibration_dialog()
+                self.check_ready_state()
+                return
+            if not self.calibration_profile.valid:
+                report = ", ".join(f"CH{i + 1} {q}" for i, q in enumerate(self.calibration_profile.quality))
+                self.lbl_cal_status.setText("Calibration rejected: " + report)
+                QMessageBox.warning(self, "Calibration Rejected", "Unsafe channel quality:\n" + "\n".join(self.calibration_profile.reasons))
+                self._close_calibration_dialog()
+                self.check_ready_state()
+                return
+            self.baseline_offsets = np.zeros(self.num_channels, dtype=np.float32)
+            if n_emg > 0:
+                self.baseline_offsets[:n_emg] = np.median(rest[:, :n_emg], axis=0).astype(np.float32)
+            with self._buffer_lock:
+                if self.sample_ring is not None:
+                    self.sample_ring.reset()
+            self.rf_valid_sample_count = self.rf_samples_since_submit = 0
+            # Fresh vote history, but every user-tuned setting carries over.
+            old = self.bridge.engine
+            self.bridge.engine = GestureDecisionEngine(min_confidence=old.min_confidence, min_margin=old.min_margin,
+                                                       consecutive_required=old.consecutive_required, refractory_s=old.refractory_s)
+            self.preprocessor = None
+            if self.rf_preprocessing_version == PREPROCESSING_VERSION:
+                self.preprocessor = RealTimePreprocessor(n_emg, PreprocessingConfig(sample_rate=SAMPLE_RATE), self.calibration_profile)
+            self.is_calibrated = True
+            summary = (f"Calibration complete.\nBaseline (ADC): {np.array2string(self.baseline_offsets, precision=1)}\n"
+                       f"Channel quality: {', '.join(f'CH{i + 1} {q}' for i, q in enumerate(self.calibration_profile.quality))}")
+            self.lbl_cal_status.setText("Calibrated - live inference running. You can enable arm control.")
+            if self.calibration_dialog:
+                self.calibration_dialog.set_finished(summary)
+                QTimer.singleShot(900, self._close_calibration_dialog)
+            self.check_ready_state()
+
+        def _close_calibration_dialog(self):
+            if self.calibration_dialog:
+                self.calibration_dialog.close()
+                self.calibration_dialog = None
+
+        def stop_calibration_if_running(self):
+            if self.calibration_active:
+                self.calibration_active = False
+                self.calibration_timer.stop()
+                self.current_phase_key = ""
+            self._close_calibration_dialog()
+            self.check_ready_state()
+
+        def cancel_calibration_sequence(self):
+            self.stop_calibration_if_running()
+            self.lbl_cal_status.setText("Calibration canceled.")
+
+        # ================================================================== streaming
+        def apply_baseline(self, raw_T):
+            adjusted = np.ascontiguousarray(raw_T, dtype=np.float32)
+            n = int(min(self.emg_channel_count, adjusted.shape[0]))
+            if n <= 0:
+                return adjusted
+            centered = adjusted[:n] - self.baseline_offsets[:n, np.newaxis]
+            for ch in range(n):
+                near = np.abs(centered[ch]) < BASE_ADAPT_GUARD
+                if np.any(near):
+                    self.baseline_offsets[ch] += BASE_ADAPT_ALPHA * float(np.mean(centered[ch, near]))
+            adjusted[:n] -= self.baseline_offsets[:n, np.newaxis]
+            return adjusted
+
+        def _push_plot(self, batch):
+            n = min(batch.shape[0], PLOT_SAMPLES)
+            emg = batch[-n:, :WIRELESS_EMG_CHANNELS].T
+            k = emg.shape[0]
+            self.plot_buf[:k] = np.roll(self.plot_buf[:k], -n, axis=1)
+            self.plot_buf[:k, -n:] = emg
+            self.plot_filled = min(PLOT_SAMPLES, self.plot_filled + n)
+
+        def on_stream_batch(self, batch):
+            meta = batch if isinstance(batch, SampleBatch) else None
+            batch = np.asarray(meta.samples if meta is not None else batch, dtype=np.float32)
+            if batch.ndim != 2 or batch.shape[1] != self.num_channels or self.sample_ring is None:
+                return
+            now = meta.host_received_monotonic if meta else time.monotonic()
+            self.last_batch_received_monotonic = now
+            self._rate_n += batch.shape[0]
+            self._push_plot(batch)
+            if meta and meta.gap_before:
+                self.rf_valid_sample_count = self.rf_samples_since_submit = 0
+                if meta.gap_before > MAX_INFERENCE_PACKET_GAP:
+                    self.stream_invalid_until = time.monotonic() + self.rf_window_samples / SAMPLE_RATE
+                LOG.warning("UDP gap: %d packet(s); inference window invalidated", meta.gap_before)
+            if self.calibration_active:
+                if self.current_phase_key == "rest":
+                    self.rest_capture.append(batch.copy())
+                elif self.current_phase_key == "flex":
+                    self.flex_capture.append(batch.copy())
+                return
+            if not self.is_calibrated:
+                return
+            raw_T = batch.T
+            if self.preprocessor is not None:
+                centered = raw_T.copy()
+                centered[:self.emg_channel_count] = self.preprocessor.process(batch[:, :self.emg_channel_count]).T
+            else:
+                centered = self.apply_baseline(raw_T)
+            t0 = time.perf_counter_ns()
+            with self._buffer_lock:
+                self.sample_ring.append(centered.T, discontinuity=bool(meta and meta.gap_before))
+            self.profiler.record_ns("buffer_append", t0)
+            self.rf_valid_sample_count = self.sample_ring.sample_count
+            self.rf_samples_since_submit += centered.shape[1]
+            model_ch = int(max(1, self.rf_model_input_channels))
+            if (self.rf_samples_since_submit >= self.rf_stride_samples
+                    and self.sample_ring.has_window(self.rf_window_samples) and self.num_channels >= model_ch):
+                self.rf_samples_since_submit = 0
+                with self._buffer_lock:
+                    win = self.sample_ring.latest(self.rf_window_samples)[:, :model_ch]
+                profile = self.calibration_profile          # profile covers the EMG channels only (IMU columns excluded)
+                quality = assess_signal_quality(win[:, :len(profile.quality)], profile) if profile is not None else SignalQuality("SIGNAL_POOR", [], "uncalibrated")
+                self.last_signal_quality = quality
+                self.update_diagnostics(quality)
+                if quality.state != "GOOD" or time.monotonic() < self.stream_invalid_until:
+                    self.disable_arm_control("Signal quality or packet continuity failed")
+                    return
+                self.inference_worker.submit_window(win)
+
+        # ================================================================== prediction -> arm
+        def update_diagnostics(self, quality=None, inference_ms=None):
+            quality = quality or self.last_signal_quality
+            q = quality.state if quality else "WAITING"
+            ch = ""
+            if quality and quality.channel_states:
+                ch = " | " + ", ".join(f"CH{i + 1} {s}" for i, s in enumerate(quality.channel_states) if s != "GOOD") if q != "GOOD" else ""
+            packet = "n/a"
+            if isinstance(self.worker, WirelessStreamWorker):
+                packet = f"{self.worker.stats.packet_loss_percent:.2f}% (jitter {self.worker.stats.jitter_ms:.1f} ms)"
+            lat = f" | inference {inference_ms:.1f} ms" if inference_ms is not None else ""
+            self.lbl_diagnostics.setText(f"Signal: {q} | Calibration: {'VALID' if self.is_calibrated else 'NOT VALID'} | Packet loss: {packet}{lat}{ch}")
+
+        def on_inference_error(self, message):
+            LOG.error("Model inference failed: %s", message)
+            self.disable_arm_control("Model inference error")
+            self.lbl_prediction.setText("UNKNOWN")
+
+        def on_prediction_ready(self, label, conf, margin, inference_ms):
+            pct = None if conf is None else conf * 100.0
+            self.lbl_prediction.setText(str(label).upper())
+            self.bar_conf.setValue(int(pct or 0))
+            self._conf_text = "Confidence: n/a" if pct is None else f"Confidence {pct:.0f}%"
+            quality_good = self.last_signal_quality is not None and self.last_signal_quality.state == "GOOD"
+            action = self.bridge.on_prediction(label, conf, margin, quality_good)
+            self.update_diagnostics(inference_ms=inference_ms)
+            active = action != IGNORE_ACTION
+            self.lbl_prediction.setStyleSheet(self._pred_style(THEME_COLORS['accent'] if active else THEME_COLORS['disabled']))
+            if self.bridge.enabled:
+                self.lbl_action.setText(f"{self._conf_text}  |  Arm action: {action.strip()}" if active else
+                                        f"{self._conf_text}  |  holding ({self.bridge.last_decision.lower().replace('_', ' ')})")
+            else:
+                self.lbl_action.setText(f"{self._conf_text}  |  arm control OFF: gesture shown, not sent")
+
+        def toggle_arm_control(self, checked):
+            ok = checked and self.is_connected and self.is_calibrated and self.model_compatible
+            self.bridge.enable(bool(ok))
+            if checked and ok:
+                self.btn_control.setText("STOP ARM CONTROL")
+                self.btn_control.setStyleSheet(f"background-color: {THEME_COLORS['special']}; font-size: 16px; padding: 12px;")
+                self._set_pill(self.pill_control, "Arm control: ON", self.PILL_OK)
+            else:
+                self.btn_control.setText("ENABLE ARM CONTROL")
+                self.btn_control.setStyleSheet("background-color: #2e7d32; font-size: 16px; padding: 12px;")
+                self._set_pill(self.pill_control, "Arm control: OFF", self.PILL_OFF)
+
+        def disable_arm_control(self, reason):
+            """Single fail-safe path for link, packet, quality and model failures: stop the arm and switch control off."""
+            was_on = self.bridge.enabled
+            self.bridge.enable(False)
+            if self.btn_control.isChecked():
+                self.btn_control.setChecked(False)
+            if was_on:
+                LOG.warning("Arm control disabled: %s", reason)
+            self.lbl_status.setText(f"Status: {reason}")
+
+        # ================================================================== periodic refresh
+        def refresh_ui(self):
+            s = self.rt.controller.snapshot()
+            x, y, z = (v * 1000 for v in s.tcp_position)
+            self.lbl_tcp.setText(f"X {x:6.1f}   Y {y:6.1f}   Z {z:6.1f} mm")
+            self.lbl_joints.setText("  ".join(f"J{i + 1} {math.degrees(a):6.1f}°" for i, a in enumerate(s.joint_angles)))
+            self.bar_gripper.setValue(int(round(s.gripper_opening * 100)))
+            if s.estopped:
+                self.lbl_safety.setText("Safety: EMERGENCY STOP latched")
+                self._set_pill(self.pill_arm, "Arm: E-STOP", self.PILL_BAD)
+            else:
+                self.lbl_safety.setText(f"Safety: {s.safety}  |  Collision: {s.collision}")
+                warn = not s.safety.ok
+                self._set_pill(self.pill_arm, "Arm: warning" if warn else "Arm: ready", self.PILL_WARN if warn else self.PILL_OK)
+            self.lbl_loop.setText(f"Control loop {s.control_hz:.0f} Hz  |  Command: {s.command}  |  Gesture: {s.gesture}")
+
+            now = time.monotonic()
+            if now - self._rate_t >= 1.0:
+                self.sample_rate_measured, self._rate_n, self._rate_t = self._rate_n / (now - self._rate_t), 0, now
+            if self.is_connected:
+                age = now - self.last_batch_received_monotonic if self.last_batch_received_monotonic else None
+                if age is not None and age > STREAM_STALL_S:
+                    self._set_pill(self.pill_device, "Device: stalled", self.PILL_WARN)
+                    self.disable_arm_control("EMG stream stalled")
+                    self.lbl_stream.setText(f"No samples for {age:.1f} s")
+                else:
+                    self.lbl_stream.setText(f"Stream: {self.sample_rate_measured:.0f} samples/s per channel (expected {SAMPLE_RATE})")
+            elif not self.worker:
+                self.lbl_stream.setText("No stream.")
+            if HAS_PYQTGRAPH and self.plot_filled:
+                data = self.plot_buf[:, PLOT_SAMPLES - self.plot_filled:]
+                xs = self._xs[PLOT_SAMPLES - self.plot_filled:]
+                centred = data - data.mean(axis=1, keepdims=True)
+                scale = max(float(np.percentile(np.abs(centred), 98)) * 1.6, 1e-6)
+                for i, c in enumerate(self.curves):
+                    c.setData(xs, centred[i] / scale * 0.45 + i)
+            if self.view.renderer is not None and self.view.isVisible():
+                self.lbl_fps.setText(f"{self.view.ms:.1f} ms")
+
+        # ================================================================== window
+        def closeEvent(self, event):
+            for t in (self.keepalive_timer, self.ui_timer, self.render_timer, self.key_timer):
+                t.stop()
+            QApplication.instance().removeEventFilter(self)
+            self.view.close_renderer()
+            self.bridge.enable(False)
+            self.disconnect_stream()
+            self.inference_worker.stop()
+            event.accept()
+            QApplication.quit()
+
+
+    def run_dashboard(rt: "SimulationRuntime", model_path: str | None = None, duration: float | None = None,
+                      fps: float = 30.0, max_mpix: float = 0.70, shadows: bool = True, frames: bool = False) -> int:
+        configure_high_dpi()
+        app = QApplication.instance() or QApplication(sys.argv)
+        rt.start()
+        win = ArmDashboard(rt, fps=fps, max_mpix=max_mpix, shadows=shadows, frames=frames)
+        win.show()
+        if model_path:
+            win.load_model(model_path)
+        if duration is not None:
+            QTimer.singleShot(int(duration * 1000), win.close)
+        try:
+            return app.exec_()
+        finally:
+            rt.stop()
+
+
+# ====================================================================================================
 # COMMAND LINE ENTRY POINT   (from main.py)
 # ====================================================================================================
 def parse_args(argv=None):
@@ -3642,19 +6274,24 @@ def parse_args(argv=None):
     ap.add_argument("--headless", action="store_true", help="no 3D window; console telemetry")
     ap.add_argument("--fast", action="store_true", help="headless only: simulate as fast as possible, deterministic")
     ap.add_argument("--duration", type=float, help="seconds to run (default: until closed)")
-    ap.add_argument("--no-physics", action="store_true", help="kinematic backend (no PyBullet dynamics)")
+    ap.add_argument("--no-physics", action="store_true", help="kinematic backend (no MuJoCo dynamics, no 3D view)")
     ap.add_argument("--no-objects", action="store_true")
-    ap.add_argument("--no-frames", action="store_true", help="do not draw coordinate frames (lighter GUI)")
+    ap.add_argument("--frames", action="store_true", help="start with link coordinate frames drawn in the 3D view")
+    ap.add_argument("--no-shadows", action="store_true", help="3D view without shadows/reflections (cooler, faster)")
     ap.add_argument("--no-log", action="store_true", help="do not write logs/session_NNN.csv")
     ap.add_argument("--log-dir", default=str(Path(__file__).resolve().parent / "logs"))
     ap.add_argument("--control-hz", type=float, default=DEFAULT_CONTROL_HZ,
                     help="control + physics rate (default %(default).0f; the original project used 240)")
-    ap.add_argument("--gui-fps", type=float, default=30.0, help="viewer window loop rate (lower = cooler)")
-    ap.add_argument("--panel", action="store_true",
-                    help="show PyBullet's slider/button sidebar (slow on the M1: ~5 fps; default is the lean view)")
+    ap.add_argument("--gui-fps", type=float, default=30.0, help="3D view frame rate (lower = cooler, default %(default).0f)")
+    ap.add_argument("--view-mpix", type=float, default=0.70,
+                    help="max 3D render size in megapixels (lower = cooler on a fanless Air, default %(default).2f)")
     ap.add_argument("--threshold", type=float, default=EMG_CONFIDENCE_THRESHOLD)
     ap.add_argument("--window", type=int, default=SMOOTHING_WINDOW)
+    ap.add_argument("--no-dashboard", action="store_true",
+                    help="console only: no window, no 3D view (use with --duration or Ctrl-C)")
+    ap.add_argument("--model", metavar="JOBLIB", help="pre-load this trained RF model in the dashboard")
     ap.add_argument("--export-urdf", metavar="PATH", help="write the generated URDF and exit")
+    ap.add_argument("--export-mjcf", metavar="PATH", help="write the generated MuJoCo model (MJCF) and exit")
     return ap.parse_args(argv)
 
 
@@ -3663,21 +6300,30 @@ def main(argv=None) -> int:
     if a.export_urdf:
         print("wrote", export_urdf(load_config(a.config), a.export_urdf))
         return 0
+    if a.export_mjcf:
+        print("wrote", export_mjcf(load_config(a.config), a.export_mjcf, Environment.default_scene()))
+        return 0
     if running_under_rosetta():
         log.warning("This Python is x86_64 running under Rosetta (2-3x slower). Use a native arm64 Python: "
                     "https://www.python.org/downloads/macos/ (universal2) or `brew install python`, then "
                     "re-create your venv.")
     rt = SimulationRuntime(config_path=a.config, mode=a.mode, emg_kind=a.emg, headless=a.headless,
                            physics=not a.no_physics, control_hz=a.control_hz, log_dir=a.log_dir,
-                           objects=not a.no_objects, show_frames=not a.no_frames, threshold=a.threshold,
-                           window=a.window, save_log=not a.no_log, gui_fps=a.gui_fps, panel=a.panel)
+                           objects=not a.no_objects, threshold=a.threshold, window=a.window,
+                           save_log=not a.no_log)
     if a.headless and a.fast:
         rt.run_fast_scripted(a.duration or 12.0)
+    elif not a.headless and not a.no_dashboard:
+        if HAS_QT and HAS_JOBLIB:
+            return run_dashboard(rt, a.model, duration=a.duration, fps=a.gui_fps, max_mpix=a.view_mpix,
+                                 shadows=not a.no_shadows, frames=a.frames)
+        log.warning("Dashboard unavailable (pip install PyQt5 pyqtgraph pyserial joblib scikit-learn); "
+                    "falling back to the console.")
+        rt.run(a.duration)
     else:
         rt.run(a.duration)
     return 0
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
     sys.exit(main())

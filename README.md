@@ -341,6 +341,26 @@ The simulator employs a multi-tiered, thread-safe pipeline designed for high res
 
 ---
 
+## 📡 Wireless EMG Armband + Control Dashboard (`robotic_arm.py`)
+
+`python robotic_arm.py` opens a BioWave-style dashboard (same dark theme and workflow as the BioWave mouse controller) next to the 3D view.
+
+```bash
+pip install numpy mujoco PyQt5 pyqtgraph pyserial joblib scikit-learn
+python robotic_arm.py                       # one window: dashboard + MuJoCo 3D view (no mjpython needed)
+python robotic_arm.py --model path/to/rf_realtime_model.joblib   # pre-load a model
+python robotic_arm.py --no-dashboard        # console only (no window)
+python robotic_arm.py --no-shadows --gui-fps 20   # cooler on a fanless MacBook Air
+```
+
+1. **Connect Device** - Wireless: *Discover* (ESP32-S3 on the same Wi-Fi), enter the access key, *Connect Wireless*. Wired: pick a serial port. New board? *Provision New Device (USB)* sends Wi-Fi credentials.
+2. **Load Pretrained Model** - the `.joblib` trained in BioWave (8 EMG + 3 IMU = 11 channels, 500 Hz). Feature extraction is the same code as the trainer.
+3. **Calibrate** - REST then FLEX. Calibration is rejected if a channel is dead, noisy, saturated or weak.
+4. **Mapping** - each model class is mapped to an arm action (defaults guessed from the class name; Rest = hold).
+5. **ENABLE ARM CONTROL** - gestures now move the arm. Control switches itself off (and the arm stops) on signal-quality failure, packet loss, a stalled stream, a lost link, or **EMERGENCY STOP**.
+
+No armband? Use *Test Without Device* (hold a gesture button) - it goes through the same pipeline.
+
 ## 🧠 Connecting Custom EMG / AI Classifiers
 
 Integrating a custom machine learning model (e.g., Random Forest, SVM, or Neural Network trained on BioWave armband data) requires subclassing [`EMGSource`](file:///Users/shimulkumarshoishob/Documents/CAPSTON_PROJECT/AntiGravity_IDE/RoboticArm/emg/emg_controller.py#L13-L25):
