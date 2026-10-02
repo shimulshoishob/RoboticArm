@@ -76,6 +76,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
@@ -113,12 +114,12 @@ HAS_QT = HAS_PYQTGRAPH = False
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 try:
-    from PyQt5.QtCore import QEvent, QSettings, Qt, QThread, QTimer, pyqtSignal
+    from PyQt5.QtCore import QEvent, QSize, QSettings, Qt, QThread, QTimer, pyqtSignal
     from PyQt5.QtGui import QFont, QImage, QPixmap
     from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                                  QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                  QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-                                 QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+                                 QSizePolicy, QSpinBox, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
     HAS_QT = True
 except ImportError:
     pass
@@ -3865,7 +3866,7 @@ MAX_INFERENCE_PACKET_GAP = 1        # A larger UDP loss invalidates a window; ne
 LOG = logging.getLogger("biowave.emg")
 extract_window_features = extract_window_features_legacy      # the ONE feature extractor (matches the trainer)
 HAS_RF_FEATURES = True
-PLOT_SAMPLES = 1000                 # 2 s of live EMG at 500 Hz
+PLOT_SAMPLES = 2500                 # 5 s of live EMG at 500 Hz
 PLOT_COLORS = ["#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231", "#911eb4", "#46f0f0", "#f032e6"]
 STREAM_STALL_S = 1.5                # no samples for this long -> arm control is switched off
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "BioWaveEMG_ArmBand" / "trained_model"
@@ -5096,6 +5097,13 @@ if HAS_QT:
                 self._release()
 
 
+    class _NoHfwLayout(QVBoxLayout):
+        """A layout that never asks its scroll area for 'height for width': otherwise QScrollArea inflates the content
+        to the height all wrapped labels would need at the current width and shows a needless scroll bar."""
+
+        def hasHeightForWidth(self):
+            return False
+
     class ViewWidget(QLabel):
         """The MuJoCo scene, rendered off-screen (SceneRenderer) and shown in a QLabel.
 
@@ -5110,7 +5118,7 @@ if HAS_QT:
             self.error = ""
             self.ms = 0.0                                   # EMA of render time (ms)
             self._last = None
-            self.setMinimumSize(360, 250)
+            self.setMinimumSize(320, 200)
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             self.setAlignment(Qt.AlignCenter)
             self.setStyleSheet(f"background:{THEME_COLORS['graph_bg']}; border-radius: 6px; color:{THEME_COLORS['muted']};")
@@ -5134,9 +5142,15 @@ if HAS_QT:
                 self.renderer.reset_view()
 
         # ---- rendering
+        def minimumSizeHint(self):
+            return QSize(320, 200)
+
+        def sizeHint(self):
+            return QSize(640, 420)
+
         def _target_size(self):
             w, h = max(64, self.width()), max(64, self.height())
-            k = min(1.0, math.sqrt(self.max_mpix * 1e6 / (w * h)))
+            k = min(1.0, math.sqrt(self.max_mpix * 1e6 / (w * h)), 1920.0 / w, 1200.0 / h)   # MJCF offscreen buffer is 1920x1200
             return int(w * k) // 2 * 2, int(h * k) // 2 * 2
 
         def render_frame(self) -> None:
@@ -5186,6 +5200,291 @@ if HAS_QT:
                 self.renderer = None
 
 
+    KEY_GUIDE = [
+        ("Move the gripper (end effector)", [
+            ("←  →", "left / right  (X axis)"),
+            ("↑  ↓", "up / down  (Z axis)"),
+            ("I   K", "forward / back  (Y axis)")]),
+        ("Move a single joint  (hold the key)", [
+            ("Q   A", "J1 base: turn one way / the other"),
+            ("W   S", "J2 shoulder"),
+            ("E   D", "J3 elbow"),
+            ("R   F", "J4 wrist pitch"),
+            ("T   G", "J5 wrist roll")]),
+        ("Gripper", [
+            ("O", "open  (press once)"),
+            ("C", "close  (press once)"),
+            ("Y   H", "open / close slowly  (hold)")]),
+        ("Safety and system", [
+            ("Esc", "EMERGENCY STOP  (then X to reset)"),
+            ("X", "reset after an emergency stop"),
+            ("Space", "stop moving"),
+            ("Z", "go to the Home pose"),
+            ("P", "pick-and-place demo")]),
+        ("Test gestures without the armband  (hold)", [
+            ("1  2  3  4", "left, right, up, down"),
+            ("5", "fist = close gripper"),
+            ("0", "rest = hold still")]),
+        ("Window", [
+            ("F11", "full-screen 3D view  (F11 or the Exit button to leave)"),
+            ("F1", "open this help")]),
+    ]
+
+    KEY_ACTIONS = {
+        "left": "move left (-X)", "right": "move right (+X)", "up": "move up (+Z)", "down": "move down (-Z)",
+        "i": "move forward (+Y)", "k": "move back (-Y)",
+        "q": "J1 base +", "a": "J1 base -", "w": "J2 shoulder +", "s": "J2 shoulder -", "e": "J3 elbow +",
+        "d": "J3 elbow -", "r": "J4 wrist pitch +", "f": "J4 wrist pitch -", "t": "J5 wrist roll +",
+        "g": "J5 wrist roll -", "y": "open gripper (slow)", "h": "close gripper (slow)",
+        "o": "open gripper", "c": "close gripper", "esc": "EMERGENCY STOP", "x": "reset", "z": "home",
+        " ": "stop", "p": "pick-and-place", "1": "test gesture: left", "2": "test gesture: right",
+        "3": "test gesture: up", "4": "test gesture: down", "5": "test gesture: fist", "0": "test gesture: rest",
+    }
+    QUALITY_COLORS = {"GOOD": "#4cc38a", "WEAK": "#f5a524", "NOISY": "#f5a524", "SATURATED": "#ff5c5c",
+                      "DEAD": "#ff5c5c", "INVALID": "#ff5c5c"}
+
+
+    def key_guide_html(compact: bool = False) -> str:
+        size = "12px" if compact else "13px"
+        rows = ""
+        for title, items in KEY_GUIDE:
+            rows += f'<tr><td colspan="2" style="padding-top:8px;color:{THEME_COLORS["accent"]};font-weight:700">{title}</td></tr>'
+            for keys, what in items:
+                rows += (f'<tr><td style="padding:2px 10px 2px 0;white-space:nowrap"><span style="background:{THEME_COLORS["panel"]};'
+                         f'border:1px solid {THEME_COLORS["muted"]};border-radius:4px;padding:1px 6px;font-weight:700">{keys}</span></td>'
+                         f'<td>{what}</td></tr>')
+        return f'<table style="font-size:{size}" cellspacing="0">{rows}</table>'
+
+
+    def help_html() -> str:
+        c = THEME_COLORS
+        h = lambda t: f'<h3 style="color:{c["accent"]};margin-bottom:2px">{t}</h3>'
+        return f"""
+    <h2>BioWave Robotic Arm - quick guide</h2>
+    {h("A. Control the arm with your EMG armband")}
+    <ol>
+    <li><b>Connect</b> (left panel, step 1). Wireless: switch the armband on, make sure this computer is on the
+    same Wi-Fi, click <i>Discover</i>, pick the device, type its access key, click <i>Connect Wireless</i>.
+    New armband? <i>Provision (USB)</i> first. Wired: choose the serial port and click <i>Connect</i>.</li>
+    <li><b>Load the model</b> (step 2): <i>Browse .joblib</i> and choose the model you trained in BioWave
+    (<code>rf_realtime_model.joblib</code>). Its gestures appear in the mapping list.</li>
+    <li><b>Calibrate</b> (step 3): click <i>Calibrate</i>. First <b>REST</b> - relax your arm completely.
+    Then <b>FLEX</b> - squeeze steadily until the timer ends. Channels with bad contact are reported.</li>
+    <li><b>Check the mapping</b>: choose which arm action each gesture triggers. <i>Rest</i> should be
+    &quot;Ignore (hold)&quot;.</li>
+    <li>Press <b>ENABLE ARM CONTROL</b>. Make a gesture and hold it: the arm moves while you hold it and stops
+    when you relax. Relax = the arm holds still.</li>
+    </ol>
+    {h("B. No armband? Try it anyway")}
+    <p>Use the keyboard (see below) or the <i>Test</i> tab: hold a button and the simulated
+    gesture goes through the same filtering and mapping as a real armband.</p>
+    {h("C. Keyboard")}
+    <p>Click the window first. Keys do nothing while you are typing in a text box. Hold <b>one</b> movement key
+    at a time.</p>
+    {key_guide_html()}
+    {h("D. 3D view")}
+    <p><b>Drag</b> = rotate, <b>right-drag</b> (or Shift+drag) = pan, <b>wheel</b> = zoom, <b>double-click</b> = reset.
+    <b>Full screen</b>: the button under the view or <b>F11</b>. The full-screen bar keeps Emergency Stop and Home within reach.
+    <i>Link frames</i> shows the coordinate axes of every joint; the red dot is the gripper tip (TCP).</p>
+    {h("E. EMG signals")}
+    <p>Click <b>Show EMG signals</b> to open a large window with one row per channel. A flat line means no signal
+    (check skin contact); a huge noisy trace means poor contact or movement. When you flex, the channels over that
+    muscle should grow. The colour of each title shows its quality (green = GOOD). Choose the time span, give all
+    channels the same scale, or pause the display.</p>
+    {h("F. Settings that matter")}
+    <ul>
+    <li><b>Minimum confidence</b>: how sure the model must be before the arm acts (raise it if the arm twitches).</li>
+    <li><b>Confidence margin</b>: the winner must beat the runner-up by this much.</li>
+    <li><b>Debounce</b>: how many consecutive predictions must agree.</li>
+    <li><b>EMG arm speed</b>: speed of gesture-driven movement. <b>Gripper cooldown</b>: minimum time between open/close.</li>
+    </ul>
+    {h("G. Safety")}
+    <ul>
+    <li><b>EMERGENCY STOP</b> (button or Esc) stops everything and latches until you press <i>Reset after stop</i> (X).</li>
+    <li>Arm control switches itself off and the arm stops if: the signal quality drops, packets are lost, the
+    stream stalls, the device link is lost, or the model fails.</li>
+    <li>The arm will not move into the table, into itself, or beyond joint limits.</li>
+    </ul>
+    {h("H. Troubleshooting")}
+    <ul>
+    <li><b>Device not found</b>: same Wi-Fi? firewall allowing UDP 5000/5001? Try <i>Discover</i> again.</li>
+    <li><b>Calibration rejected</b>: the message lists the bad channels. Moisten/reseat the electrodes, relax fully
+    during REST, flex harder during FLEX.</li>
+    <li><b>ENABLE ARM CONTROL is greyed out</b>: you need all of: connected, model loaded, calibrated.</li>
+    <li><b>Arm does not move</b>: is the gesture mapped to an action (not &quot;Ignore&quot;)? Is the status strip
+    showing E-STOP? Press X. Try lowering Minimum confidence.</li>
+    <li><b>Keys do nothing</b>: click the window; close any text box focus; check the line under the 3D view.</li>
+    </ul>
+    """
+
+
+    class HelpDialog(QDialog):
+        """Scrollable user guide (F1)."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("BioWave Robotic Arm - Help")
+            self.resize(780, 700)
+            self.setStyleSheet(app_stylesheet(13))
+            lay = QVBoxLayout(self)
+            view = QTextBrowser()
+            view.setOpenExternalLinks(False)
+            view.setHtml(help_html())
+            lay.addWidget(view)
+            btn = QPushButton("Close")
+            btn.clicked.connect(self.close)
+            lay.addWidget(btn)
+
+
+    class EMGWindow(QWidget):
+        """Large, readable per-channel EMG view, opened on demand from the dashboard."""
+
+        SPANS = (("1 second", 1.0), ("2 seconds", 2.0), ("5 seconds", 5.0))
+
+        def __init__(self, dash):
+            super().__init__(None, Qt.Window)
+            self.dash, self.paused = dash, False
+            self.setWindowTitle("BioWave - Live EMG signals")
+            self.resize(1000, 780)
+            self.setStyleSheet(app_stylesheet(12))
+            apply_dark_title_bar(self)
+            lay = QVBoxLayout(self)
+            intro = QLabel("One row per EMG channel, centred on its baseline. A flat line = no signal (check skin contact). "
+                           "A huge noisy trace = poor contact or movement. Flex your muscle: the matching channels should grow. "
+                           "Title colour: green = good quality.")
+            intro.setWordWrap(True)
+            intro.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            lay.addWidget(intro)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Time span:"))
+            self.combo_span = QComboBox()
+            for text, sec in self.SPANS:
+                self.combo_span.addItem(text, sec)
+            self.combo_span.setCurrentIndex(1)
+            row.addWidget(self.combo_span)
+            self.chk_same = QCheckBox("Same scale on all channels")
+            self.chk_same.setToolTip("Off: every row auto-scales (best for checking contact). "
+                                     "On: rows share one scale (best for comparing channel strength).")
+            row.addWidget(self.chk_same)
+            self.btn_pause = QPushButton("Pause")
+            self.btn_pause.setCheckable(True)
+            self.btn_pause.toggled.connect(self._toggle_pause)
+            row.addWidget(self.btn_pause)
+            row.addStretch(1)
+            self.lbl_status = QLabel("")
+            self.lbl_status.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            row.addWidget(self.lbl_status)
+            lay.addLayout(row)
+            self.glw = pg.GraphicsLayoutWidget()
+            self.glw.setBackground(THEME_COLORS["graph_bg"])
+            self.plots, self.curves = [], []
+            for i in range(WIRELESS_EMG_CHANNELS):
+                p = self.glw.addPlot(row=i, col=0)
+                p.setMouseEnabled(False, False)
+                p.hideButtons()
+                p.showGrid(y=True, x=False, alpha=0.12)
+                p.getAxis("left").setWidth(56)
+                p.getAxis("left").setPen(pg.mkPen(THEME_COLORS["muted"]))
+                p.getAxis("left").setTextPen(pg.mkPen(THEME_COLORS["text"]))
+                p.getAxis("bottom").setPen(pg.mkPen(THEME_COLORS["muted"]))
+                p.getAxis("bottom").setTextPen(pg.mkPen(THEME_COLORS["text"]))
+                if i < WIRELESS_EMG_CHANNELS - 1:
+                    p.getAxis("bottom").setStyle(showValues=False, tickLength=0)
+                else:
+                    p.setLabel("bottom", "seconds  (0 = now)")
+                p.setTitle(f"CH{i + 1}", color=THEME_COLORS["muted"], size="9pt")
+                self.plots.append(p)
+                self.curves.append(p.plot(pen=pg.mkPen(PLOT_COLORS[i % len(PLOT_COLORS)], width=1.2)))
+            lay.addWidget(self.glw, 1)
+
+        def _toggle_pause(self, on):
+            self.paused = on
+            self.btn_pause.setText("Resume" if on else "Pause")
+
+        def _states(self):
+            d = self.dash
+            if d.last_signal_quality is not None and d.last_signal_quality.channel_states:
+                return list(d.last_signal_quality.channel_states)
+            if d.calibration_profile is not None:
+                return list(d.calibration_profile.quality)
+            return []
+
+        def closeEvent(self, ev):
+            self.dash.btn_emg.setChecked(False)
+            ev.accept()
+
+        def refresh(self):
+            if not self.isVisible() or self.paused:
+                return
+            d = self.dash
+            span = float(self.combo_span.currentData())
+            n = min(d.plot_filled, int(span * SAMPLE_RATE))
+            states = self._states()
+            if n < 10:
+                self.lbl_status.setText("Waiting for samples... connect the armband (step 1).")
+                return
+            data = d.plot_buf[:WIRELESS_EMG_CHANNELS, PLOT_SAMPLES - n:]
+            centred = data - data.mean(axis=1, keepdims=True)
+            step = max(1, n // 700)
+            xs = (np.arange(n)[::step] - n) / float(SAMPLE_RATE)
+            amp = np.maximum(np.percentile(np.abs(centred), 99, axis=1), 1.0)
+            if self.chk_same.isChecked():
+                amp[:] = amp.max()
+            for i in range(WIRELESS_EMG_CHANNELS):
+                self.curves[i].setData(xs, centred[i][::step])
+                self.plots[i].setYRange(-float(amp[i]) * 1.25, float(amp[i]) * 1.25, padding=0)
+                self.plots[i].setXRange(-float(span), 0, padding=0)
+                st = states[i] if i < len(states) else ("not calibrated yet" if not d.is_calibrated else "?")
+                self.plots[i].setTitle(f"CH{i + 1}   {st}   (range +/-{amp[i]:.0f})",
+                                       color=QUALITY_COLORS.get(st, THEME_COLORS["muted"]), size="9pt")
+            self.lbl_status.setText(f"{d.sample_rate_measured:.0f} samples/s per channel (expected {SAMPLE_RATE})")
+
+
+    class FullscreenView(QWidget):
+        """Full-screen 3D view with a small control bar (Exit, Emergency Stop, Home) and live status."""
+
+        def __init__(self, dash):
+            super().__init__(None, Qt.Window)
+            self.dash = dash
+            self.setWindowTitle("BioWave - 3D view")
+            self.setStyleSheet(app_stylesheet(12))
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(0)
+            self.view = ViewWidget(dash.rt.backend, max(dash.view_max_mpix, 1.4), dash.view.shadows)
+            self.view.frames = dash.view.frames
+            lay.addWidget(self.view, 1)
+            bar = QFrame()
+            bar.setStyleSheet(f"background:{THEME_COLORS['title_bar']};")
+            row = QHBoxLayout(bar)
+            btn = QPushButton("Exit full screen  (F11)")
+            btn.clicked.connect(dash.toggle_fullscreen)
+            row.addWidget(btn)
+            estop = QPushButton("EMERGENCY STOP  (Esc)")
+            estop.setStyleSheet(f"background-color: {THEME_COLORS['special']}; font-weight: 700; padding: 6px 14px;")
+            estop.clicked.connect(dash.emergency_stop)
+            row.addWidget(estop)
+            for text, fn in (("Home  (Z)", lambda: dash.send(MotionCommand.home(source="fullscreen"))),
+                             ("Reset  (X)", lambda: dash.send(MotionCommand(RESET, source="fullscreen")))):
+                b = QPushButton(text)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            self.lbl = QLabel("")
+            self.lbl.setStyleSheet("font-weight: 600;")
+            row.addWidget(self.lbl, 1)
+            self.lbl_keys = QLabel("")
+            self.lbl_keys.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            self.lbl_keys.setWordWrap(True)
+            self.lbl_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lay.addWidget(bar)
+
+        def closeEvent(self, ev):
+            self.view.close_renderer()
+            ev.accept()
+            if self.dash.fs is self:
+                self.dash.fs = None
+
+
     class ArmDashboard(QMainWindow):
         """BioWave-style control centre for the simulated arm.
 
@@ -5208,6 +5507,8 @@ if HAS_QT:
             screen = QApplication.primaryScreen().availableGeometry() if QApplication.primaryScreen() else None
             w, h = (1360, 860) if screen is None else (min(1360, int(screen.width() * .96)), min(860, int(screen.height() * .94)))
             self.resize(w, h)
+            if screen is not None:                       # open fully on-screen (macOS would otherwise shrink the window)
+                self.move(screen.x() + max(0, (screen.width() - w) // 2), screen.y())
             self.setStyleSheet(app_stylesheet(12))
             apply_dark_title_bar(self)
             self._settings = QSettings("BioWave", "RoboticArm")
@@ -5255,7 +5556,7 @@ if HAS_QT:
             self.rf_valid_sample_count = 0
             self.rf_samples_since_submit = 0
             self.last_signal_quality = None
-            self.plot_buf = np.zeros((WIRELESS_EMG_CHANNELS, PLOT_SAMPLES), dtype=np.float32)
+            self.plot_buf = np.zeros((WIRELESS_TOTAL_CHANNELS, PLOT_SAMPLES), dtype=np.float32)
             self.plot_filled = 0
             self.packets_in_last_second, self._rate_t, self._rate_n, self.sample_rate_measured = 0, time.monotonic(), 0, 0.0
             # ---- arm control
@@ -5263,8 +5564,12 @@ if HAS_QT:
                                        speed_m_s=EMG_SPEED_M_S)
             self.mapping_combos = {}
             # ---- keyboard (same keys as before, now handled by this window)
-            self.kb = KeyboardController(self.send, self.rt.mode, None, demo=self.rt.start_demo)
+            self.kb = KeyboardController(self._send_key, self.rt.mode, None, demo=self.rt.start_demo)
+            self.fs = None                                  # FullscreenView while open
+            self.emg_win = None                             # EMGWindow once opened
+            self.help_dlg = None
             self._held, self._trig = set(), set()
+            self._last_key_action, self._last_key_t = "", 0.0
 
             self.init_ui()
 
@@ -5280,7 +5585,7 @@ if HAS_QT:
             self.ui_timer.timeout.connect(self.refresh_ui)
             self.ui_timer.start(66)
             self.render_timer = QTimer(self)                # 3D view
-            self.render_timer.timeout.connect(self.view.render_frame)
+            self.render_timer.timeout.connect(self._render_tick)
             self.render_timer.start(int(1000 / max(1.0, self.view_fps)))
             self.key_timer = QTimer(self)                   # 30 Hz: held keys -> jog commands
             self.key_timer.timeout.connect(self.poll_keys)
@@ -5311,7 +5616,7 @@ if HAS_QT:
 
         def init_ui(self):
             central = QWidget()
-            root = QVBoxLayout(central)
+            root = _NoHfwLayout(central)
             root.setSpacing(10)
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -5330,7 +5635,16 @@ if HAS_QT:
             self.pill_arm = self._pill("Arm: ready")
             for p in (self.pill_device, self.pill_model, self.pill_cal, self.pill_control, self.pill_arm):
                 strip.addWidget(p)
+            self.btn_help = QPushButton("Help  (F1)")
+            self.btn_help.setToolTip("Quick start, keyboard map, EMG tips, safety and troubleshooting")
+            self.btn_help.clicked.connect(self.show_help)
+            strip.addWidget(self.btn_help)
             root.addLayout(strip)
+            self.lbl_next = QLabel("")
+            self.lbl_next.setWordWrap(True)
+            self.lbl_next.setStyleSheet(f"background:{THEME_COLORS['panel']}; border-left: 4px solid {THEME_COLORS['accent']};"
+                                        " padding: 6px 10px; font-weight: 600;")
+            root.addWidget(self.lbl_next)
 
             body = QHBoxLayout()
             body.setSpacing(14)
@@ -5345,8 +5659,8 @@ if HAS_QT:
             # ============ LEFT: setup (connect -> model -> calibrate)
             g, lay = self._group("1  Connect Device")
             self.tabs = QTabWidget()
-            self.tabs.addTab(self._build_wireless_tab(), "Wireless (Wi-Fi)")
-            self.tabs.addTab(self._build_wired_tab(), "Wired (USB / Serial)")
+            self.tabs.addTab(self._build_wireless_tab(), "Wi-Fi")
+            self.tabs.addTab(self._build_wired_tab(), "Wired USB")
             lay.addWidget(self.tabs)
             self.lbl_conn_status = QLabel("Status: Disconnected")
             self.lbl_conn_status.setAlignment(Qt.AlignCenter)
@@ -5372,13 +5686,16 @@ if HAS_QT:
             g, lay = self._group("3  Calibrate")
             form = QFormLayout()
             self.spin_rest_sec, self.spin_flex_sec = QSpinBox(), QSpinBox()
-            for sp, val, lab in ((self.spin_rest_sec, self.cal_rest_seconds, "Rest duration:"),
-                                 (self.spin_flex_sec, self.cal_flex_seconds, "Flex duration:")):
+            durations = QHBoxLayout()
+            for sp, val, lab in ((self.spin_rest_sec, self.cal_rest_seconds, "Rest:"),
+                                 (self.spin_flex_sec, self.cal_flex_seconds, "Flex:")):
                 sp.setRange(CAL_DURATION_MIN_S, CAL_DURATION_MAX_S)
                 sp.setValue(val)
                 sp.setSuffix(" sec")
-                form.addRow(lab, sp)
-            lay.addLayout(form)
+                sp.setToolTip(f"How long the {lab[:-1].upper()} phase of the calibration lasts")
+                durations.addWidget(QLabel(lab))
+                durations.addWidget(sp, 1)
+            lay.addLayout(durations)
             self.btn_calibrate = QPushButton("Calibrate")
             self.btn_calibrate.setEnabled(False)
             self.btn_calibrate.clicked.connect(self.start_calibration_sequence)
@@ -5392,7 +5709,7 @@ if HAS_QT:
             g, lay = self._group("Gesture to Arm-Action Mapping")
             self.scroll_map = QScrollArea()
             self.scroll_map.setWidgetResizable(True)
-            self.scroll_map.setMinimumHeight(120)
+            self.scroll_map.setMinimumHeight(90)
             self.map_content = QWidget()
             self.map_form = QFormLayout(self.map_content)
             self.scroll_map.setWidget(self.map_content)
@@ -5409,22 +5726,30 @@ if HAS_QT:
             self.view.frames = self.view_frames
             lay.addWidget(self.view, 1)
             row = QHBoxLayout()
-            self.chk_frames = QCheckBox("Link frames")
+            self.chk_frames = QCheckBox("Frames")
             self.chk_frames.setChecked(self.view_frames)
             self.chk_frames.toggled.connect(self.view.set_frames)
             self.chk_shadows = QCheckBox("Shadows")
             self.chk_shadows.setChecked(self.view_shadows)
             self.chk_shadows.toggled.connect(self.view.set_shadows)
-            btn = QPushButton("Reset view")
+            btn = QPushButton("Reset")
+            btn.setToolTip("Back to the default camera angle (also: double-click the view)")
             btn.clicked.connect(self.view.reset_view)
+            self.btn_fullscreen = QPushButton("Full screen")
+            self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
             self.lbl_fps = QLabel("")
             self.lbl_fps.setToolTip("3D view: drag = orbit, right-drag = pan, wheel = zoom, double-click = reset")
             self.lbl_fps.setStyleSheet(f"color: {THEME_COLORS['muted']};")
-            for w_ in (self.chk_frames, self.chk_shadows, btn):
+            for w_ in (self.chk_frames, self.chk_shadows, btn, self.btn_fullscreen):
                 row.addWidget(w_)
             row.addStretch(1)
             row.addWidget(self.lbl_fps)
             lay.addLayout(row)
+            self.lbl_keys = QLabel("")
+            self.lbl_keys.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            self.lbl_keys.setWordWrap(True)
+            self.lbl_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            lay.addWidget(self.lbl_keys)
             middle.addWidget(g, 5)
 
             g, lay = self._group("Live Gesture")
@@ -5457,31 +5782,17 @@ if HAS_QT:
             self.lbl_status.setAlignment(Qt.AlignCenter)
             self.lbl_status.setStyleSheet(f"color: {THEME_COLORS['muted']};")
             lay.addWidget(self.lbl_status)
-            middle.addWidget(g)
-
-            g, lay = self._group("Live EMG (8 channels)")
-            self.plot = pg.PlotWidget()
-            self.plot.setBackground(THEME_COLORS["graph_bg"])
-            self.plot.setMinimumHeight(110)
-            self.plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)    # its huge sizeHint must not grow the window
-            self.plot.setMouseEnabled(False, False)
-            self.plot.hideButtons()
-            self.plot.showGrid(x=False, y=True, alpha=0.15)
-            self.plot.setYRange(-0.8, WIRELESS_EMG_CHANNELS - 0.2, padding=0)
-            self.plot.setXRange(0, PLOT_SAMPLES, padding=0)
-            for axis in ("left", "bottom"):
-                self.plot.getAxis(axis).setPen(pg.mkPen(THEME_COLORS["muted"]))
-                self.plot.getAxis(axis).setTextPen(pg.mkPen(THEME_COLORS["text"]))
-            self.plot.getAxis("left").setTicks([[(i, f"CH{i + 1}") for i in range(WIRELESS_EMG_CHANNELS)]])
-            self.plot.getAxis("bottom").setStyle(showValues=False)
-            self.curves = [self.plot.plot(pen=pg.mkPen(PLOT_COLORS[i % len(PLOT_COLORS)], width=1))
-                           for i in range(WIRELESS_EMG_CHANNELS)]
-            self._xs = np.arange(PLOT_SAMPLES)
-            lay.addWidget(self.plot)
+            row = QHBoxLayout()
+            self.btn_emg = QPushButton("Show EMG signals")
+            self.btn_emg.setCheckable(True)
+            self.btn_emg.setToolTip("Open a large window with the live signal of every EMG channel")
+            self.btn_emg.toggled.connect(self.toggle_emg_window)
+            row.addWidget(self.btn_emg)
             self.lbl_stream = QLabel("No stream.")
             self.lbl_stream.setStyleSheet(f"color: {THEME_COLORS['muted']};")
-            lay.addWidget(self.lbl_stream)
-            middle.addWidget(g, 2)
+            row.addWidget(self.lbl_stream, 1)
+            lay.addLayout(row)
+            middle.addWidget(g)
 
             # ============ RIGHT: arm state, commands, jog / test / settings
             g, lay = self._group("Arm State")
@@ -5512,10 +5823,10 @@ if HAS_QT:
             grid = QGridLayout()
             for i, (text, fn) in enumerate((("Home  (Z)", lambda: self.send(MotionCommand.home(source="dashboard"))),
                                             ("Stop  (Space)", lambda: self.send(MotionCommand.stop(source="dashboard"))),
-                                            ("Reset after stop  (X)", lambda: self.send(MotionCommand(RESET, source="dashboard"))),
-                                            ("Pick && place  (P)", self.rt.start_demo),
-                                            ("Open gripper  (O)", lambda: self.send(MotionCommand.gripper("OPEN", source="dashboard"))),
-                                            ("Close gripper  (C)", lambda: self.send(MotionCommand.gripper("CLOSE", source="dashboard"))))):
+                                            ("Reset  (X)", lambda: self.send(MotionCommand(RESET, source="dashboard"))),
+                                            ("Pick/place  (P)", self.rt.start_demo),
+                                            ("Open  (O)", lambda: self.send(MotionCommand.gripper("OPEN", source="dashboard"))),
+                                            ("Close  (C)", lambda: self.send(MotionCommand.gripper("CLOSE", source="dashboard"))))):
                 b = QPushButton(text)
                 b.clicked.connect(fn)
                 grid.addWidget(b, i // 2, i % 2)
@@ -5523,6 +5834,25 @@ if HAS_QT:
             right.addWidget(g)
 
             tabs = QTabWidget()
+            self.tabs_right = tabs
+            # -- keyboard guide
+            w_ = QWidget()
+            kl = QVBoxLayout(w_)
+            kl.setContentsMargins(4, 4, 4, 4)
+            sc = QScrollArea()
+            sc.setWidgetResizable(True)
+            sc.setFrameShape(QFrame.NoFrame)
+            lab = QLabel(key_guide_html(compact=True))
+            lab.setTextFormat(Qt.RichText)
+            lab.setWordWrap(True)
+            lab.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            sc.setWidget(lab)
+            kl.addWidget(sc, 1)
+            tip = QLabel("Click the window first. Hold ONE movement key at a time. Esc = emergency stop.")
+            tip.setWordWrap(True)
+            tip.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px;")
+            kl.addWidget(tip)
+            tabs.addTab(w_, "Keys")
             # -- manual jog
             w_ = QWidget()
             pad = QGridLayout(w_)
@@ -5539,11 +5869,11 @@ if HAS_QT:
             self.spin_speed_jog.setSuffix(" mm/s")
             pad.addWidget(QLabel("Jog speed:"), 3, 0)
             pad.addWidget(self.spin_speed_jog, 3, 1, 1, 2)
-            note = QLabel("Hold a button, or use the arrow keys / I / K (joints: Q A  W S  E D  R F  T G).")
+            note = QLabel("Hold a button to move the gripper (same as the arrow keys and I / K).")
             note.setWordWrap(True)
             note.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px;")
             pad.addWidget(note, 4, 0, 1, 3)
-            tabs.addTab(w_, "Manual Jog")
+            tabs.addTab(w_, "Jog")
             # -- test without device
             w_ = QWidget()
             row = QGridLayout(w_)
@@ -5558,7 +5888,7 @@ if HAS_QT:
             note.setWordWrap(True)
             note.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px;")
             row.addWidget(note, 2, 0, 1, 3)
-            tabs.addTab(w_, "Test Without Device")
+            tabs.addTab(w_, "Test")
             # -- control settings
             w_ = QWidget()
             form = QFormLayout(w_)
@@ -5596,12 +5926,15 @@ if HAS_QT:
             self.spin_grip_refr.setSuffix(" sec")
             self.spin_grip_refr.valueChanged.connect(lambda v: setattr(self.bridge.engine, "refractory_s", v))
             form.addRow("Gripper Cooldown:", self.spin_grip_refr)
-            tabs.addTab(w_, "Control Settings")
+            tabs.addTab(w_, "Settings")
             right.addWidget(tabs)
             right.addStretch(1)
 
             if not HAS_PYQTGRAPH:
-                self.lbl_stream.setText("pyqtgraph missing - live EMG plot disabled.")
+                self.btn_emg.setEnabled(False)
+                self.btn_emg.setToolTip("pyqtgraph is missing: pip install pyqtgraph")
+            self._apply_tooltips()
+            self.refresh_guidance()
 
         def _build_wireless_tab(self):
             w = QWidget()
@@ -5609,12 +5942,15 @@ if HAS_QT:
             row = QHBoxLayout()
             row.addWidget(QLabel("Access Key:"))
             self.txt_access_key = QLineEdit(self.wireless_access_key)
+            self.txt_access_key.setMinimumWidth(60)
             self.txt_access_key.setEchoMode(QLineEdit.Password)
             row.addWidget(self.txt_access_key, 1)
             lay.addLayout(row)
             row = QHBoxLayout()
             row.addWidget(QLabel("Device:"))
             self.combo_devices = QComboBox()
+            self.combo_devices.setMinimumContentsLength(10)
+            self.combo_devices.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             row.addWidget(self.combo_devices, 1)
             btn = QPushButton("Discover")
             btn.clicked.connect(self.discover_wireless_devices)
@@ -5625,12 +5961,15 @@ if HAS_QT:
             self.lbl_device_info.setStyleSheet(f"color: {THEME_COLORS['muted']};")
             lay.addWidget(self.lbl_device_info)
             self.combo_devices.currentIndexChanged.connect(self._refresh_device_info)
-            btn = QPushButton("Provision New Device (USB)")
+            row = QHBoxLayout()
+            btn = QPushButton("Provision (USB)")
+            btn.setToolTip("First-time setup of a new armband: send it your Wi-Fi name and password over USB")
             btn.clicked.connect(lambda: ProvisionDialog(self).exec_())
-            lay.addWidget(btn)
+            row.addWidget(btn)
             self.btn_wireless_connect = QPushButton("Connect Wireless")
             self.btn_wireless_connect.clicked.connect(self.toggle_wireless_connection)
-            lay.addWidget(self.btn_wireless_connect)
+            row.addWidget(self.btn_wireless_connect, 1)
+            lay.addLayout(row)
             return w
 
         def _build_wired_tab(self):
@@ -5668,9 +6007,22 @@ if HAS_QT:
             t = ev.text().lower()
             return t if len(t) == 1 and t.isprintable() else None
 
+        def _active(self) -> bool:
+            w = QApplication.activeWindow()
+            return self.isActiveWindow() or (w is not None and w is self.fs)
+
+        def _send_key(self, cmd) -> bool:
+            """Keyboard jogs follow the 'Jog speed' setting (the planner default is very slow)."""
+            if cmd.command_type == CARTESIAN and cmd.speed is None:
+                cmd.speed = self.spin_speed_jog.value() / 1000.0
+            return self.send(cmd)
+
         def eventFilter(self, obj, ev):
-            if ev.type() not in (QEvent.KeyPress, QEvent.KeyRelease) or not self.isActiveWindow() or ev.isAutoRepeat():
+            if ev.type() not in (QEvent.KeyPress, QEvent.KeyRelease) or not self._active() or ev.isAutoRepeat():
                 return False
+            if ev.type() == QEvent.KeyPress and ev.key() in (Qt.Key_F11, Qt.Key_F1):
+                (self.toggle_fullscreen if ev.key() == Qt.Key_F11 else self.show_help)()
+                return True
             if isinstance(QApplication.focusWidget(), (QLineEdit, QAbstractSpinBox)):
                 return False                                # typing in a text box / spin box: not a robot key
             name = self._key_name(ev)
@@ -5683,6 +6035,7 @@ if HAS_QT:
             if ev.type() == QEvent.KeyPress:
                 self._held.add(name)
                 self._trig.add(name)
+                self._last_key_action, self._last_key_t = KEY_ACTIONS.get(name, name), time.monotonic()
                 if gesture:
                     self.mock_gesture(gesture)
             else:
@@ -5692,13 +6045,20 @@ if HAS_QT:
             return True
 
         def poll_keys(self):
-            if not self.isActiveWindow():
+            if not self._active():
                 if self._held:
                     self._held.clear()
                     self.mock_gesture(None)
                 return
             trig, self._trig = self._trig, set()
             self.kb.update({k for k in self._held if k not in KEY_TO_GESTURE}, {k for k in trig if k not in KEY_TO_GESTURE})
+
+        def _key_hint_text(self) -> str:
+            if self._held:
+                return "Keyboard: " + " + ".join(KEY_ACTIONS.get(k, k) for k in sorted(self._held))
+            if self._last_key_t and time.monotonic() - self._last_key_t < 2.0:
+                return f"Keyboard: {self._last_key_action}"
+            return "Keys: arrows move  |  O / C gripper  |  Esc E-STOP  |  F11 full screen  |  F1 help"
 
         # ================================================================== helpers
         def send(self, cmd) -> bool:
@@ -5714,7 +6074,85 @@ if HAS_QT:
         def emergency_stop(self):
             self.btn_control.setChecked(False)
             self.send(MotionCommand(ESTOP, source="dashboard"))
-            self.lbl_status.setText("Status: EMERGENCY STOP - press 'Reset after stop' to continue")
+            self.lbl_status.setText("Status: EMERGENCY STOP - press 'Reset after stop' (X) to continue")
+
+        # ---- full screen / EMG window / help
+        def toggle_fullscreen(self):
+            if self.fs is not None:
+                fs, self.fs = self.fs, None
+                fs.close()
+                self.activateWindow()
+                return
+            self.fs = FullscreenView(self)
+            self.fs.show()
+            self.fs.showFullScreen()
+            self.fs.activateWindow()
+
+        def _render_tick(self):
+            (self.fs.view if self.fs is not None else self.view).render_frame()
+
+        def toggle_emg_window(self, on):
+            if not on:
+                if self.emg_win is not None:
+                    self.emg_win.hide()
+                return
+            if self.emg_win is None:
+                self.emg_win = EMGWindow(self)
+            self.emg_win.show()
+            self.emg_win.raise_()
+            self.emg_win.refresh()
+
+        def show_help(self):
+            if self.help_dlg is None:
+                self.help_dlg = HelpDialog(self)
+            self.help_dlg.show()
+            self.help_dlg.raise_()
+
+        def refresh_guidance(self):
+            """One plain-language 'what to do next' line, always visible under the title."""
+            if self.rt.controller.estopped:
+                msg = "EMERGENCY STOP is active. Press 'Reset after stop' (X) to re-arm the arm."
+            elif self.calibration_active:
+                msg = "Calibrating: follow the REST / FLEX prompts. Keep the armband still on your arm."
+            elif self.bridge.enabled:
+                msg = "Arm control is ON: hold a gesture to move the arm, relax to hold still. Esc = emergency stop."
+            elif not self.is_connected and not self.model_loaded:
+                msg = ("Step 1: connect your armband (left panel).   No armband? Use the keyboard (Keys tab) "
+                       "or the 'Test' tab. Press F1 for the full guide.")
+            elif not self.is_connected:
+                msg = "Step 1: connect your armband (Wireless: Discover, access key, Connect)."
+            elif not self.model_loaded:
+                msg = "Step 2: load your trained model (Browse .joblib)."
+            elif not self.model_compatible:
+                msg = "The model does not match this device: " + self.model_compatibility_message.splitlines()[0]
+            elif not self.is_calibrated:
+                msg = "Step 3: click Calibrate. Relax your arm during REST, then squeeze steadily during FLEX."
+            else:
+                msg = "Step 4: check the gesture mapping, then press ENABLE ARM CONTROL."
+            if self.lbl_next.text() != msg:
+                self.lbl_next.setText(msg)
+
+        def _apply_tooltips(self):
+            tips = {
+                self.btn_calibrate: "Records your relaxed (REST) and squeezed (FLEX) signal to set the baseline and check channel quality.",
+                self.btn_control: "Lets recognised gestures move the arm. Switches itself off if the signal or link fails.",
+                self.btn_estop: "Stops everything immediately. Latches until 'Reset after stop'. Shortcut: Esc.",
+                self.spin_conf: "How sure the model must be before the arm acts. Raise it if the arm twitches.",
+                self.spin_margin: "The best gesture must beat the second-best by this many points.",
+                self.spin_debounce: "How many predictions in a row must agree before the arm moves.",
+                self.spin_speed: "Arm speed when driven by gestures.",
+                self.spin_grip_refr: "Minimum time between gripper open/close actions.",
+                self.spin_speed_jog: "Speed of the jog buttons and the keyboard arrow keys.",
+                self.chk_frames: "Draw the coordinate axes of every joint.",
+                self.chk_shadows: "Turn off for a faster, cooler 3D view on a fanless laptop.",
+                self.btn_fullscreen: "Show the 3D view full screen. Leave with F11 or the Exit button.",
+                self.txt_access_key: "The device access key set in the armband firmware (DEVICE_ACCESS_KEY).",
+                self.btn_wireless_connect: "Start streaming from the selected armband over Wi-Fi.",
+                self.btn_wired_connect: "Start streaming from the selected serial port.",
+                self.combo_devices: "Armbands found on this Wi-Fi network. Click Discover to search.",
+            }
+            for w_, t in tips.items():
+                w_.setToolTip(t)
 
         # ================================================================== wired
         def refresh_wired_ports(self):
@@ -5875,7 +6313,11 @@ if HAS_QT:
 
         def load_model(self, path: str) -> bool:
             try:
-                artifact = joblib.load(path)
+                with warnings.catch_warnings(record=True) as wlist:
+                    warnings.simplefilter("always")
+                    artifact = joblib.load(path)
+                lib_notes = sorted({("saved with another scikit-learn version (normally fine)" if "unpickle" in str(w_.message)
+                                 else str(w_.message).split("\n")[0][:110]) for w_ in wlist})
                 model = artifact["model"]
                 names = list(artifact.get("class_names", artifact.get("classes", [])))
                 if not names and hasattr(model, "classes_"):
@@ -5899,10 +6341,11 @@ if HAS_QT:
                 self.build_mapping_ui(self.rf_class_names)
                 self.model_loaded = True
                 self.lbl_model_info.setText(f"{len(self.rf_class_names)} gestures: {', '.join(self.rf_class_names)}\n"
-                                            f"window {self.rf_window_samples} samples, {self.rf_model_input_channels} input channels")
+                                            f"window {self.rf_window_samples} samples, {self.rf_model_input_channels} input channels"
+                                            + ("\nNote: " + " ".join(lib_notes) if lib_notes else ""))
                 self._set_pill(self.pill_model, "Model: loaded", self.PILL_OK)
                 if comp.warnings:                  # legacy models lack metadata: note it, do not block with a dialog
-                    self.lbl_model_info.setText(self.lbl_model_info.text() + "\nNote: " + " ".join(comp.warnings))
+                    self.lbl_model_info.setText(self.lbl_model_info.text() + "\nNote: older model without metadata - legacy mode.")
                 self.check_ready_state()
                 return True
             except Exception as exc:
@@ -6079,10 +6522,9 @@ if HAS_QT:
 
         def _push_plot(self, batch):
             n = min(batch.shape[0], PLOT_SAMPLES)
-            emg = batch[-n:, :WIRELESS_EMG_CHANNELS].T
-            k = emg.shape[0]
+            k = min(batch.shape[1], self.plot_buf.shape[0])
             self.plot_buf[:k] = np.roll(self.plot_buf[:k], -n, axis=1)
-            self.plot_buf[:k, -n:] = emg
+            self.plot_buf[:k, -n:] = batch[-n:, :k].T
             self.plot_filled = min(PLOT_SAMPLES, self.plot_filled + n)
 
         def on_stream_batch(self, batch):
@@ -6219,20 +6661,25 @@ if HAS_QT:
                     self.lbl_stream.setText(f"Stream: {self.sample_rate_measured:.0f} samples/s per channel (expected {SAMPLE_RATE})")
             elif not self.worker:
                 self.lbl_stream.setText("No stream.")
-            if HAS_PYQTGRAPH and self.plot_filled:
-                data = self.plot_buf[:, PLOT_SAMPLES - self.plot_filled:]
-                xs = self._xs[PLOT_SAMPLES - self.plot_filled:]
-                centred = data - data.mean(axis=1, keepdims=True)
-                scale = max(float(np.percentile(np.abs(centred), 98)) * 1.6, 1e-6)
-                for i, c in enumerate(self.curves):
-                    c.setData(xs, centred[i] / scale * 0.45 + i)
-            if self.view.renderer is not None and self.view.isVisible():
-                self.lbl_fps.setText(f"{self.view.ms:.1f} ms")
+            if self.emg_win is not None and self.emg_win.isVisible():
+                self.emg_win.refresh()
+            view = self.fs.view if self.fs is not None else self.view
+            if view.renderer is not None and view.isVisible():
+                self.lbl_fps.setText(f"{view.ms:.1f} ms")
+            if self.fs is not None:
+                self.fs.lbl.setText(f"X {x:6.1f}  Y {y:6.1f}  Z {z:6.1f} mm   |   gripper {s.gripper_opening * 100:3.0f}%   |   "
+                                    + ("E-STOP" if s.estopped else f"safety {s.safety}") + "   |   " + self._key_hint_text())
+            self.lbl_keys.setText(self._key_hint_text())
+            self.refresh_guidance()
 
         # ================================================================== window
         def closeEvent(self, event):
             for t in (self.keepalive_timer, self.ui_timer, self.render_timer, self.key_timer):
                 t.stop()
+            for w_ in (self.fs, self.emg_win, self.help_dlg):
+                if w_ is not None:
+                    w_.close()
+            self.fs = None
             QApplication.instance().removeEventFilter(self)
             self.view.close_renderer()
             self.bridge.enable(False)
@@ -6257,6 +6704,8 @@ if HAS_QT:
             return app.exec_()
         finally:
             rt.stop()
+
+
 
 
 # ====================================================================================================

@@ -156,3 +156,77 @@ def test_dashboard_renders_the_mujoco_scene_and_keys_drive_the_arm():
     finally:
         win.close()
         rt.stop()
+
+
+def _key(app, widget, key, text="", press=True):
+    from PyQt5.QtCore import QEvent
+    from PyQt5.QtGui import QKeyEvent
+    ev = QKeyEvent(QEvent.KeyPress if press else QEvent.KeyRelease, key, ra.Qt.NoModifier, text)
+    app.sendEvent(widget, ev)
+
+
+@mj
+@pytest.mark.skipif(not (ra.HAS_QT and ra.HAS_PYQTGRAPH), reason="PyQt5 / pyqtgraph not installed")
+def test_fullscreen_emg_window_help_keys_and_guidance(monkeypatch):
+    rt = ra.SimulationRuntime(headless=True, physics=True, save_log=False, mode="full", control_hz=120.0)
+    app = ra.QApplication.instance() or ra.QApplication([])
+    rt.start()
+    win = ra.ArmDashboard(rt, fps=30, max_mpix=0.3)
+    try:
+        win.show()
+        monkeypatch.setattr(win, "isActiveWindow", lambda: True)
+        app.processEvents()
+        # ---- guidance changes with state, and starts with something actionable
+        win.refresh_guidance()
+        assert "Step 1" in win.lbl_next.text()
+        win.is_connected = True
+        win.refresh_guidance()
+        assert "Step 2" in win.lbl_next.text()
+        win.is_connected = False
+        # ---- real key events through the app-wide filter
+        _key(app, win, ra.Qt.Key_Up, "")
+        assert "up" in win._held and "move up" in win._key_hint_text()
+        _key(app, win, ra.Qt.Key_Up, "", press=False)
+        assert "up" not in win._held
+        _key(app, win, ra.Qt.Key_F1)
+        assert win.help_dlg is not None and win.help_dlg.isVisible()
+        win.help_dlg.close()
+        # ---- full screen: F11 opens, F11 closes, esc still reaches the e-stop path
+        _key(app, win, ra.Qt.Key_F11)
+        assert win.fs is not None
+        win.fs.view.render_frame()
+        assert not win.fs.view.error
+        monkeypatch.setattr(ra.QApplication, "activeWindow", staticmethod(lambda: win.fs))
+        win.refresh_ui()
+        assert "Keyboard" in win.fs.lbl.text() or "mm" in win.fs.lbl.text()
+        _key(app, win.fs, ra.Qt.Key_Escape)
+        win.poll_keys()
+        assert rt.controller.estopped
+        win.send(ra.MotionCommand(ra.RESET, source="test"))
+        _key(app, win.fs, ra.Qt.Key_Escape, press=False)
+        _key(app, win.fs, ra.Qt.Key_F11)
+        assert win.fs is None
+        monkeypatch.undo()
+        monkeypatch.setattr(win, "isActiveWindow", lambda: True)
+        # ---- EMG window: hidden until asked, shows 8 labelled channels when data flows
+        assert win.emg_win is None
+        rng = np.random.default_rng(0)
+        win.num_channels, win.emg_channel_count, win.is_connected = 11, 8, True
+        win._reset_stream_state()
+        for i in range(60):
+            b = rng.normal(0, 20, (25, 11)).astype(np.float32)
+            b[:, 2] += 200 * np.sin(np.arange(25) / 3 + i)
+            win.on_stream_batch(b)
+        win.btn_emg.setChecked(True)
+        assert win.emg_win is not None and win.emg_win.isVisible()
+        win.emg_win.refresh()
+        assert len(win.emg_win.curves) == 8
+        title = win.emg_win.plots[2].titleLabel.text
+        assert "CH3" in title
+        win.emg_win.chk_same.setChecked(True)
+        win.emg_win.btn_pause.setChecked(True)
+        win.emg_win.close()
+        assert not win.btn_emg.isChecked()
+    finally:
+        win.close()
+        rt.stop()

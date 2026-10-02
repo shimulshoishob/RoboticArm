@@ -359,7 +359,23 @@ python robotic_arm.py --no-shadows --gui-fps 20   # cooler on a fanless MacBook 
 4. **Mapping** - each model class is mapped to an arm action (defaults guessed from the class name; Rest = hold).
 5. **ENABLE ARM CONTROL** - gestures now move the arm. Control switches itself off (and the arm stops) on signal-quality failure, packet loss, a stalled stream, a lost link, or **EMERGENCY STOP**.
 
-No armband? Use *Test Without Device* (hold a gesture button) - it goes through the same pipeline.
+No armband? Use the **Test** tab (hold a gesture button) or the keyboard - it goes through the same pipeline.
+
+**In-app help:** press **F1** (or *Help*) for the full guide. The blue bar under the title always says what to do next.
+
+| Keys (click the window first, hold ONE movement key at a time) | |
+|---|---|
+| Arrows | move the gripper left/right (X) and up/down (Z) |
+| I / K | forward / back (Y) |
+| Q A, W S, E D, R F, T G | joints J1-J5 (hold) |
+| O / C, Y / H | gripper open / close (press once / hold) |
+| Esc | **EMERGENCY STOP** (X resets it) |
+| Space / Z / P | stop / home / pick-and-place demo |
+| 1 2 3 4 / 5 / 0 | test gestures: left right up down / fist / rest |
+| F11 | full-screen 3D view (F11 or the Exit button to leave) |
+| F1 | help |
+
+**Show EMG signals** opens a large window with one labelled, quality-coloured row per channel (time span, shared scale and pause options).
 
 ## 🧠 Connecting Custom EMG / AI Classifiers
 
