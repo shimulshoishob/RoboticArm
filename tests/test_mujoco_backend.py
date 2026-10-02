@@ -230,3 +230,108 @@ def test_fullscreen_emg_window_help_keys_and_guidance(monkeypatch):
     finally:
         win.close()
         rt.stop()
+
+
+@mj
+def test_objects_can_be_added_cleared_limited_and_reached():
+    rt = ra.SimulationRuntime(headless=True, physics=True, save_log=False, mode="manual", control_hz=120.0)
+    rt.start()
+    try:
+        n0 = len(rt.env.objects)
+        assert n0 == 3
+        rt.controller.move_joints(np.radians([20, 30, 50, 90, 0]), wait=True)       # arm pose survives a rebuild
+        q_before, _ = rt.backend.read_state()
+        kinds = []
+        for k in ("cube", "sphere", "cylinder", "cube", "sphere", "cylinder", "cube", "cube"):
+            o = rt.add_random_object(k)
+            if o:
+                kinds.append(o.kind)
+        assert len(rt.env.objects) == ra.MAX_OBJECTS == 10                          # capped at 10
+        assert len(kinds) == 7 and rt.add_random_object("cube") is None
+        names = [o.name for o in rt.env.objects]
+        assert len(set(names)) == len(names)
+        q_after, _ = rt.backend.read_state()
+        assert q_after == pytest.approx(q_before, abs=0.02)
+        for o in rt.env.objects:                                                    # all on the table, none overlapping
+            assert rt.backend.object_position(o.name)[2] < 0.05
+        pts = np.array([o.position[:2] for o in rt.env.objects])
+        d = np.linalg.norm(pts[:, None] - pts[None], axis=2) + np.eye(len(pts)) * 9
+        assert d.min() > 0.03
+        for o in rt.env.objects[3:]:                                                # new ones are reachable
+            r = math.hypot(*o.position[:2])
+            assert 0.11 < r < 0.23 and o.position[1] > 0
+        rt.clear_objects()
+        assert rt.env.objects == [] and rt.backend.model.nbody == 9
+        rt.reset_objects()
+        assert [o.name for o in rt.env.objects] == ["cube", "sphere", "cylinder"]
+        assert rt.backend.object_position("sphere") is not None
+        with pytest.raises(ValueError):
+            rt.add_random_object("pyramid")
+    finally:
+        rt.stop()
+
+
+@mj
+@pytest.mark.skipif(not ra.HAS_QT, reason="PyQt5 not installed")
+def test_renderer_follows_a_rebuilt_scene():
+    rt = ra.SimulationRuntime(headless=True, physics=True, save_log=False, mode="manual", control_hz=120.0)
+    app = ra.QApplication.instance() or ra.QApplication([])
+    rt.start()
+    try:
+        r = ra.SceneRenderer(rt.backend, 320, 200)
+        a = r.render().astype(float)
+        assert rt.add_random_object("sphere") is not None
+        b = r.render().astype(float)
+        assert r.version == rt.backend.model_version and r.model is rt.backend.model
+        assert np.abs(a - b).sum() > 0                                              # the new object is drawn
+        r.close()
+    finally:
+        rt.stop()
+
+
+@mj
+@pytest.mark.skipif(not ra.HAS_QT, reason="PyQt5 not installed")
+def test_fullscreen_objects_tips_and_collapsible_mapping():
+    rt = ra.SimulationRuntime(headless=True, physics=True, save_log=False, mode="full", control_hz=120.0)
+    app = ra.QApplication.instance() or ra.QApplication([])
+    rt.start()
+    win = ra.ArmDashboard(rt, fps=30, max_mpix=0.3)
+    try:
+        win.show()
+        app.processEvents()
+        # mapping is hidden behind a button until needed
+        assert not win.grp_map.isVisible() and "Show" in win.btn_map.text()
+        win.btn_map.setChecked(True)
+        assert win.grp_map.isVisible() and "Hide" in win.btn_map.text()
+        win.btn_map.setChecked(False)
+        assert not win.grp_map.isVisible()
+        # full screen: tips overlay + object controls
+        win.toggle_fullscreen()
+        fs = win.fs
+        fs.show()
+        app.processEvents()
+        assert "EMERGENCY STOP" in fs.tips.text() and fs.tips.isVisible()
+        fs.btn_tips.setChecked(False)
+        assert not fs.tips.isVisible()
+        assert fs.lbl_count.text() == "3 / 10"
+        shapes = [fs.combo_shape.itemData(i) for i in range(fs.combo_shape.count())]
+        assert shapes == ["cube", "sphere", "cylinder"]
+        for i in range(7):
+            fs.combo_shape.setCurrentIndex(i % 3)
+            fs.add_object()
+            app.processEvents()
+            fs.view.render_frame()
+        assert fs.lbl_count.text() == "10 / 10" and not fs.btn_add.isEnabled()
+        fs.btn_add.setEnabled(True)
+        fs.add_object()
+        assert "full" in fs.lbl_msg.text().lower() and len(rt.env.objects) == 10
+        assert not fs.view.error
+        fs.clear_objects()
+        assert fs.lbl_count.text() == "0 / 10"
+        fs.reset_objects()
+        assert fs.lbl_count.text() == "3 / 10" and fs.btn_add.isEnabled()
+        win.toggle_fullscreen()
+        assert win.fs is None
+    finally:
+        win.close()
+        rt.stop()

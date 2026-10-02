@@ -2209,9 +2209,33 @@ class MuJoCoBackend(PhysicsBackend):
 
     # ------------------------------------------------------------------ lifecycle
     def connect(self, env: Environment | None = None) -> None:
-        env = env or Environment()
+        self._build(env or Environment())
+
+    def rebuild(self, env: Environment) -> None:
+        """Apply a changed object list. MuJoCo models are immutable, so compile a new one and carry over the arm
+        pose and the current pose of every object that is still in the scene."""
+        with self.lock:
+            q5, opening = self.read_state()
+            carried = {}
+            for name, bid in self._body_id.items():
+                j = int(self.model.body_jntadr[bid])
+                qa = int(self.model.jnt_qposadr[j])
+                carried[name] = self.data.qpos[qa:qa + 7].copy()
+            self._build(env)
+            for name, qpos in carried.items():
+                if name in self._body_id:
+                    j = int(self.model.body_jntadr[self._body_id[name]])
+                    qa = int(self.model.jnt_qposadr[j])
+                    self.data.qpos[qa:qa + 7] = qpos
+            self.reset_state(q5, opening)
+            for name, o in self.objects.items():                 # keep Environment in sync with where things are now
+                o.position = tuple(float(v) for v in self.data.xpos[self._body_id[name]])
+
+    def _build(self, env: Environment) -> None:
         mj = mujoco
         with self.lock:
+            self.model_version = getattr(self, "model_version", 0) + 1
+            self.__dict__.pop("_link_set", None)
             self.model = mj.MjModel.from_xml_string(build_mjcf(self.cfg, env, self.dt / self.substeps))
             self.data = mj.MjData(self.model)
             m = self.model
@@ -2288,6 +2312,11 @@ class MuJoCoBackend(PhysicsBackend):
         with self.lock:
             return self.data.qpos.copy()
 
+    def view_snapshot(self):
+        """(model version, model, qpos) taken atomically, so a renderer notices when the scene was rebuilt."""
+        with self.lock:
+            return self.model_version, self.model, self.data.qpos.copy()
+
     def get_contacts(self) -> list:
         """Unwanted contacts: robot vs table/floor/objects, excluding base-table and finger-object (grasp)."""
         found = set()
@@ -2326,7 +2355,7 @@ class MuJoCoBackend(PhysicsBackend):
 class SceneRenderer:
     def __init__(self, backend: "MuJoCoBackend", width: int = 960, height: int = 600, shadows: bool = True):
         self.backend = backend
-        self.model = backend.model
+        self.version, self.model, _ = backend.view_snapshot()
         self.data = mujoco.MjData(self.model)
         self.size = (int(width), int(height))
         self.renderer = mujoco.Renderer(self.model, self.size[1], self.size[0])
@@ -2353,8 +2382,20 @@ class SceneRenderer:
         self.size = (int(width), int(height))
         self.renderer = mujoco.Renderer(self.model, self.size[1], self.size[0])
 
+    def _reload(self, version: int, model) -> None:
+        """The backend compiled a new model (objects added/removed): rebuild our copy and the GL renderer."""
+        self.renderer.close()
+        self.version, self.model = version, model
+        self.data = mujoco.MjData(model)
+        self.model.vis.scale.framelength = 0.35
+        self.model.vis.scale.framewidth = 0.04
+        self.renderer = mujoco.Renderer(model, self.size[1], self.size[0])
+
     def render(self) -> np.ndarray:
-        self.data.qpos[:] = self.backend.view_qpos()
+        version, model, qpos = self.backend.view_snapshot()
+        if version != self.version:
+            self._reload(version, model)
+        self.data.qpos[:] = qpos
         mujoco.mj_kinematics(self.model, self.data)
         self.renderer.update_scene(self.data, camera=self.cam, scene_option=self.opt)
         self.renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = int(self.shadows)
@@ -4460,6 +4501,10 @@ MODES = ("full", "manual", "emg")
 # Physics cost is per step. 120 Hz halves the CPU/heat of the original 240 Hz with no visible change in the arm's
 # behaviour (planner runs at 100 Hz, EMG at 50 Hz, GUI at 30 Hz anyway) - good for a fanless MacBook Air.
 DEFAULT_CONTROL_HZ = 120.0
+MAX_OBJECTS = 10                      # most objects allowed on the table at once
+OBJECT_KINDS = ("cube", "sphere", "cylinder")
+OBJECT_COLORS = ((0.85, 0.25, 0.20, 1), (0.20, 0.50, 0.85, 1), (0.25, 0.70, 0.35, 1), (0.95, 0.75, 0.15, 1),
+                 (0.65, 0.35, 0.85, 1), (0.95, 0.50, 0.15, 1), (0.15, 0.75, 0.75, 1), (0.90, 0.40, 0.65, 1))
 
 
 class KeepAwake:
@@ -4569,10 +4614,63 @@ class SimulationRuntime:
             elif delay < -0.1:                  # fell far behind: do not spiral, resync
                 nxt = time.perf_counter()
 
+    # ------------------------------------------------------------------ objects on the table (max MAX_OBJECTS)
+    def _apply_objects(self) -> None:
+        if hasattr(self.backend, "rebuild"):
+            self.backend.rebuild(self.env)
+
+    def random_reachable_position(self, kind: str, rng=None):
+        """A free spot on the table that the gripper can really reach (checked with the arm's own IK), or None."""
+        rng = rng or np.random.default_rng()
+        proto = {"cube": make_cube, "sphere": make_sphere, "cylinder": make_cylinder}[kind]("probe", 0.0, 0.0)
+        radius = proto.width / 2
+        ik = self.controller.arm.ik_solver
+        home = np.asarray(self.cfg.home_angles, dtype=float)
+        for _ in range(800):
+            r = rng.uniform(0.12, 0.22)
+            th = math.radians(rng.uniform(35.0, 145.0))              # in front of the arm, away from its base
+            x, y = r * math.cos(th), r * math.sin(th)
+            if any(math.hypot(x - o.position[0], y - o.position[1]) < radius + o.width / 2 + 0.012
+                   for o in self.env.objects):
+                continue
+            grip_z = max(proto.half_height, 0.022)
+            if ik.solve(np.array([x, y, grip_z]), tool_pitch=math.pi, seed=home).success:
+                return x, y
+        return None
+
+    def add_random_object(self, kind: str):
+        """Add one object of ``kind`` at a random reachable spot. Returns the SimObject, or None (limit / no room)."""
+        if kind not in OBJECT_KINDS:
+            raise ValueError(f"kind must be one of {OBJECT_KINDS}")
+        if len(self.env.objects) >= MAX_OBJECTS:
+            return None
+        spot = self.random_reachable_position(kind)
+        if spot is None:
+            return None
+        n = 1 + max([int(o.name.rsplit("_", 1)[1]) for o in self.env.objects if o.name.rsplit("_", 1)[-1].isdigit()] or [0])
+        color = OBJECT_COLORS[len(self.env.objects) % len(OBJECT_COLORS)]
+        maker = {"cube": make_cube, "sphere": make_sphere, "cylinder": make_cylinder}[kind]
+        obj = self.env.add(maker(f"{kind}_{n}", spot[0], spot[1], color=color))
+        self._apply_objects()
+        return obj
+
+    def clear_objects(self) -> None:
+        self.env.objects.clear()
+        self._apply_objects()
+
+    def reset_objects(self) -> None:
+        self.env.objects[:] = Environment.default_scene().objects
+        self._apply_objects()
+
     # ------------------------------------------------------------------ pick-and-place demo (key P / button)
+    def _demo_target(self):
+        cubes = [o for o in self.env.objects if o.kind == "cube"]
+        pool = cubes or list(self.env.objects)
+        return pool[0] if pool else None
+
     def start_demo(self) -> None:
-        if "cube" not in {o.name for o in self.env.objects}:
-            log.warning("pick-and-place demo needs the default scene (do not use --no-objects)")
+        if self._demo_target() is None:
+            log.warning("pick-and-place demo needs an object on the table (add one from the full-screen view)")
             return
         if self._demo_thread and self._demo_thread.is_alive():
             return
@@ -4584,12 +4682,14 @@ class SimulationRuntime:
         try:
             if c.blocked:
                 c.reset()
-            cube = self.env.get("cube")
-            pos = self.backend.object_position("cube") or cube.position
+            cube = self._demo_target()
+            if cube is None:
+                return
+            pos = self.backend.object_position(cube.name) or cube.position
             grip_z = max(cube.half_height, 0.022)               # keep the fingertips above the table
             dx = 0.08 if pos[0] + 0.08 <= 0.25 else -0.08
             c.home(wait=True)
-            ok = pick_and_place(c, "cube", np.array([pos[0], pos[1], grip_z]),
+            ok = pick_and_place(c, cube.name, np.array([pos[0], pos[1], grip_z]),
                                 np.array([pos[0] + dx, pos[1], grip_z + 0.002]))
             log.info("pick-and-place demo: %s", "done" if ok else "failed (see warnings above)")
         except Exception:
@@ -5115,6 +5215,7 @@ if HAS_QT:
             super().__init__()
             self.backend, self.max_mpix, self.shadows, self.frames = backend, max_mpix, shadows, False
             self.renderer = None
+            self.initial_distance = None                    # None = default camera distance
             self.error = ""
             self.ms = 0.0                                   # EMA of render time (ms)
             self._last = None
@@ -5140,6 +5241,8 @@ if HAS_QT:
         def reset_view(self) -> None:
             if self.renderer:
                 self.renderer.reset_view()
+                if self.initial_distance:
+                    self.renderer.cam.distance = self.initial_distance
 
         # ---- rendering
         def minimumSizeHint(self):
@@ -5161,6 +5264,8 @@ if HAS_QT:
                 if self.renderer is None:
                     self.renderer = SceneRenderer(self.backend, tw, th, self.shadows)
                     self.renderer.set_frames(self.frames)
+                    if self.initial_distance:
+                        self.renderer.cam.distance = self.initial_distance
                 elif abs(tw - self.renderer.size[0]) > 16 or abs(th - self.renderer.size[1]) > 16:
                     self.renderer.resize(tw, th)
                 t0 = time.perf_counter()
@@ -5270,8 +5375,8 @@ if HAS_QT:
     (<code>rf_realtime_model.joblib</code>). Its gestures appear in the mapping list.</li>
     <li><b>Calibrate</b> (step 3): click <i>Calibrate</i>. First <b>REST</b> - relax your arm completely.
     Then <b>FLEX</b> - squeeze steadily until the timer ends. Channels with bad contact are reported.</li>
-    <li><b>Check the mapping</b>: choose which arm action each gesture triggers. <i>Rest</i> should be
-    &quot;Ignore (hold)&quot;.</li>
+    <li><b>Check the mapping</b>: click <i>Show / edit gesture &rarr; arm action mapping</i> (left panel) and choose which
+    arm action each gesture triggers. <i>Rest</i> should be &quot;Ignore (hold)&quot;. Click the button again to hide the list.</li>
     <li>Press <b>ENABLE ARM CONTROL</b>. Make a gesture and hold it: the arm moves while you hold it and stops
     when you relax. Relax = the arm holds still.</li>
     </ol>
@@ -5286,6 +5391,9 @@ if HAS_QT:
     <p><b>Drag</b> = rotate, <b>right-drag</b> (or Shift+drag) = pan, <b>wheel</b> = zoom, <b>double-click</b> = reset.
     <b>Full screen</b>: the button under the view or <b>F11</b>. The full-screen bar keeps Emergency Stop and Home within reach.
     <i>Link frames</i> shows the coordinate axes of every joint; the red dot is the gripper tip (TCP).</p>
+    <p><b>Objects (full screen only)</b>: pick a shape (cube, sphere or cylinder) and click <i>Add object</i>: it appears at a
+    random spot the arm can reach. Up to {MAX_OBJECTS} objects. <i>Clear all</i> empties the table, <i>Reset objects</i>
+    restores the starting three. The pick-and-place demo (P) uses the first cube, or the first object if there is no cube.</p>
     {h("E. EMG signals")}
     <p>Click <b>Show EMG signals</b> to open a large window with one row per channel. A flat line means no signal
     (check skin contact); a huge noisy trace means poor contact or movement. When you flex, the channels over that
@@ -5325,7 +5433,7 @@ if HAS_QT:
             super().__init__(parent)
             self.setWindowTitle("BioWave Robotic Arm - Help")
             self.resize(780, 700)
-            self.setStyleSheet(app_stylesheet(13))
+            self.setStyleSheet(ux_stylesheet(13))
             lay = QVBoxLayout(self)
             view = QTextBrowser()
             view.setOpenExternalLinks(False)
@@ -5346,7 +5454,7 @@ if HAS_QT:
             self.dash, self.paused = dash, False
             self.setWindowTitle("BioWave - Live EMG signals")
             self.resize(1000, 780)
-            self.setStyleSheet(app_stylesheet(12))
+            self.setStyleSheet(ux_stylesheet(12))
             apply_dark_title_bar(self)
             lay = QVBoxLayout(self)
             intro = QLabel("One row per EMG channel, centred on its baseline. A flat line = no signal (check skin contact). "
@@ -5383,7 +5491,10 @@ if HAS_QT:
                 p.setMouseEnabled(False, False)
                 p.hideButtons()
                 p.showGrid(y=True, x=False, alpha=0.12)
-                p.getAxis("left").setWidth(56)
+                p.getAxis("left").setWidth(14)
+                p.getAxis("left").setStyle(showValues=False, tickLength=0)      # the range is printed in the title instead
+                p.setYRange(-1, 1, padding=0)
+                p.setXRange(-2, 0, padding=0)
                 p.getAxis("left").setPen(pg.mkPen(THEME_COLORS["muted"]))
                 p.getAxis("left").setTextPen(pg.mkPen(THEME_COLORS["text"]))
                 p.getAxis("bottom").setPen(pg.mkPen(THEME_COLORS["muted"]))
@@ -5392,10 +5503,30 @@ if HAS_QT:
                     p.getAxis("bottom").setStyle(showValues=False, tickLength=0)
                 else:
                     p.setLabel("bottom", "seconds  (0 = now)")
-                p.setTitle(f"CH{i + 1}", color=THEME_COLORS["muted"], size="9pt")
+                    p.getAxis("bottom").setStyle(tickFont=QFont("Arial", 9))
+                p.setTitle(f"CH{i + 1}   waiting for signal", color=THEME_COLORS["muted"], size="9pt")
                 self.plots.append(p)
                 self.curves.append(p.plot(pen=pg.mkPen(PLOT_COLORS[i % len(PLOT_COLORS)], width=1.2)))
+            self.glw.setMinimumHeight(WIRELESS_EMG_CHANNELS * 56)
             lay.addWidget(self.glw, 1)
+            # shown over the empty plots until samples arrive
+            self.lbl_wait = QLabel("No EMG signal yet.\nConnect the armband (step 1 in the main window)\nor wait for samples to arrive.",
+                                   self.glw)
+            self.lbl_wait.setAlignment(Qt.AlignCenter)
+            self.lbl_wait.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self.lbl_wait.setStyleSheet(f"background: rgba(13,27,51,215); color: {THEME_COLORS['text']}; border-radius: 10px;"
+                                        " padding: 14px; font-size: 14px;")
+            self._place_wait()
+
+        def _place_wait(self):
+            self.lbl_wait.adjustSize()
+            self.lbl_wait.move(max(0, (self.glw.width() - self.lbl_wait.width()) // 2),
+                               max(0, (self.glw.height() - self.lbl_wait.height()) // 2))
+
+        def resizeEvent(self, ev):
+            super().resizeEvent(ev)
+            if hasattr(self, "lbl_wait"):
+                self._place_wait()
 
         def _toggle_pause(self, on):
             self.paused = on
@@ -5420,8 +5551,10 @@ if HAS_QT:
             span = float(self.combo_span.currentData())
             n = min(d.plot_filled, int(span * SAMPLE_RATE))
             states = self._states()
+            self.lbl_wait.setVisible(n < 10)
             if n < 10:
-                self.lbl_status.setText("Waiting for samples... connect the armband (step 1).")
+                self._place_wait()
+                self.lbl_status.setText("Waiting for samples...")
                 return
             data = d.plot_buf[:WIRELESS_EMG_CHANNELS, PLOT_SAMPLES - n:]
             centred = data - data.mean(axis=1, keepdims=True)
@@ -5440,23 +5573,65 @@ if HAS_QT:
             self.lbl_status.setText(f"{d.sample_rate_measured:.0f} samples/s per channel (expected {SAMPLE_RATE})")
 
 
+    def keycap(text: str) -> str:
+        return (f'<span style="background:{THEME_COLORS["panel"]};border:1px solid {THEME_COLORS["muted"]};'
+                f'border-radius:4px;padding:1px 6px;font-weight:700">{text}</span>')
+
+
+    def ux_stylesheet(size: int = 12) -> str:
+        """app_stylesheet + visible check boxes (the base theme draws an unchecked box invisibly dark)."""
+        c = THEME_COLORS
+        return app_stylesheet(size) + f"""
+    QCheckBox {{ spacing: 6px; }}
+    QCheckBox::indicator {{ width: 15px; height: 15px; border: 1px solid {c['muted']}; border-radius: 3px;
+                           background: {c['title_bar']}; }}
+    QCheckBox::indicator:checked {{ background: {c['accent']}; border-color: {c['text']}; }}
+    QToolTip {{ background: {c['title_bar']}; color: {c['text']}; border: 1px solid {c['accent']}; padding: 4px; }}
+    """
+
+
     class FullscreenView(QWidget):
-        """Full-screen 3D view with a small control bar (Exit, Emergency Stop, Home) and live status."""
+        """Full-screen 3D view: short on-screen operating instructions, object controls (max 10) and a control bar."""
+
+        SHAPES = (("Cube", "cube"), ("Sphere", "sphere"), ("Cylinder", "cylinder"))
 
         def __init__(self, dash):
             super().__init__(None, Qt.Window)
             self.dash = dash
             self.setWindowTitle("BioWave - 3D view")
-            self.setStyleSheet(app_stylesheet(12))
+            self.setStyleSheet(ux_stylesheet(12))
             lay = QVBoxLayout(self)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(0)
             self.view = ViewWidget(dash.rt.backend, max(dash.view_max_mpix, 1.4), dash.view.shadows)
             self.view.frames = dash.view.frames
+            self.view.initial_distance = 0.70                 # a little closer than the small view: objects are the point
             lay.addWidget(self.view, 1)
+
+            # ---- operating instructions, drawn over the 3D scene (mouse passes through to the camera controls)
+            self.tips = QLabel(self.view)
+            self.tips.setTextFormat(Qt.RichText)
+            self.tips.setAttribute(Qt.WA_TransparentForMouseEvents)
+            self.tips.setStyleSheet(f"background: rgba(13,27,51,210); color: {THEME_COLORS['text']}; border-radius: 10px;"
+                                    " padding: 10px 14px; font-size: 13px;")
+            self.tips.setText(
+                "<b>How to drive the arm</b><br>"
+                f"{keycap('&larr;')} {keycap('&rarr;')} {keycap('&uarr;')} {keycap('&darr;')} &nbsp;move the gripper<br>"
+                f"{keycap('I')} {keycap('K')} &nbsp;move forward / back<br>"
+                f"{keycap('O')} open gripper &nbsp;&nbsp;{keycap('C')} close gripper<br>"
+                f"{keycap('Z')} home &nbsp;&nbsp;{keycap('Space')} stop<br>"
+                f"<span style='color:#ff8a8a'>{keycap('Esc')} <b>EMERGENCY STOP</b></span><br>"
+                f"{keycap('F11')} leave full screen &nbsp;&nbsp;{keycap('F1')} full help")
+            self.tips.adjustSize()
+            self.tips.move(16, 16)
+
             bar = QFrame()
             bar.setStyleSheet(f"background:{THEME_COLORS['title_bar']};")
-            row = QHBoxLayout(bar)
+            vb = QVBoxLayout(bar)
+            vb.setContentsMargins(8, 6, 8, 6)
+            vb.setSpacing(6)
+            # ---- row 1: arm
+            row = QHBoxLayout()
             btn = QPushButton("Exit full screen  (F11)")
             btn.clicked.connect(dash.toggle_fullscreen)
             row.addWidget(btn)
@@ -5469,14 +5644,70 @@ if HAS_QT:
                 b = QPushButton(text)
                 b.clicked.connect(fn)
                 row.addWidget(b)
+            self.btn_tips = QPushButton("Tips")
+            self.btn_tips.setCheckable(True)
+            self.btn_tips.setChecked(True)
+            self.btn_tips.setToolTip("Show / hide the on-screen operating instructions")
+            self.btn_tips.toggled.connect(self.tips.setVisible)
+            row.addWidget(self.btn_tips)
             self.lbl = QLabel("")
             self.lbl.setStyleSheet("font-weight: 600;")
             row.addWidget(self.lbl, 1)
-            self.lbl_keys = QLabel("")
-            self.lbl_keys.setStyleSheet(f"color: {THEME_COLORS['muted']};")
-            self.lbl_keys.setWordWrap(True)
-            self.lbl_keys.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            vb.addLayout(row)
+            # ---- row 2: objects
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Objects:"))
+            self.combo_shape = QComboBox()
+            for text, kind in self.SHAPES:
+                self.combo_shape.addItem(text, kind)
+            self.combo_shape.setToolTip("Shape of the next object")
+            row.addWidget(self.combo_shape)
+            self.btn_add = QPushButton("Add object")
+            self.btn_add.setToolTip(f"Drop one object of this shape at a random spot the arm can reach (max {MAX_OBJECTS})")
+            self.btn_add.clicked.connect(self.add_object)
+            row.addWidget(self.btn_add)
+            for text, tip, fn in (("Clear all", "Remove every object from the table", self.clear_objects),
+                                  ("Reset objects", "Back to the starting cube, sphere and cylinder", self.reset_objects)):
+                b = QPushButton(text)
+                b.setToolTip(tip)
+                b.clicked.connect(fn)
+                row.addWidget(b)
+            self.lbl_count = QLabel("")
+            self.lbl_count.setStyleSheet("font-weight: 600;")
+            row.addWidget(self.lbl_count)
+            self.lbl_msg = QLabel("")
+            self.lbl_msg.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            row.addWidget(self.lbl_msg, 1)
+            vb.addLayout(row)
             lay.addWidget(bar)
+            self.update_count()
+
+        # ---- objects
+        def update_count(self):
+            n = len(self.dash.rt.env.objects)
+            self.lbl_count.setText(f"{n} / {MAX_OBJECTS}")
+            self.btn_add.setEnabled(n < MAX_OBJECTS)
+
+        def add_object(self):
+            kind = self.combo_shape.currentData()
+            obj = self.dash.rt.add_random_object(kind)
+            if obj is not None:
+                self.lbl_msg.setText(f"Added a {kind} where the arm can reach it.")
+            elif len(self.dash.rt.env.objects) >= MAX_OBJECTS:
+                self.lbl_msg.setText(f"The table is full ({MAX_OBJECTS} objects). Clear some first.")
+            else:
+                self.lbl_msg.setText("No free spot within reach - clear an object first.")
+            self.update_count()
+
+        def clear_objects(self):
+            self.dash.rt.clear_objects()
+            self.lbl_msg.setText("Table cleared.")
+            self.update_count()
+
+        def reset_objects(self):
+            self.dash.rt.reset_objects()
+            self.lbl_msg.setText("Back to the starting objects.")
+            self.update_count()
 
         def closeEvent(self, ev):
             self.view.close_renderer()
@@ -5509,7 +5740,7 @@ if HAS_QT:
             self.resize(w, h)
             if screen is not None:                       # open fully on-screen (macOS would otherwise shrink the window)
                 self.move(screen.x() + max(0, (screen.width() - w) // 2), screen.y())
-            self.setStyleSheet(app_stylesheet(12))
+            self.setStyleSheet(ux_stylesheet(12))
             apply_dark_title_bar(self)
             self._settings = QSettings("BioWave", "RoboticArm")
 
@@ -5706,7 +5937,14 @@ if HAS_QT:
             lay.addWidget(self.lbl_cal_status)
             left.addWidget(g)
 
+            self.btn_map = QPushButton("")
+            self.btn_map.setCheckable(True)
+            self.btn_map.setToolTip("Choose which arm action each gesture of your model triggers")
+            self.btn_map.toggled.connect(self._toggle_mapping)
+            left.addWidget(self.btn_map)
             g, lay = self._group("Gesture to Arm-Action Mapping")
+            self.grp_map = g
+            g.setVisible(False)
             self.scroll_map = QScrollArea()
             self.scroll_map.setWidgetResizable(True)
             self.scroll_map.setMinimumHeight(90)
@@ -5718,6 +5956,8 @@ if HAS_QT:
             self.lbl_map_hint.setStyleSheet(f"color: {THEME_COLORS['muted']};")
             self.map_form.addRow(self.lbl_map_hint)
             left.addWidget(g, 1)
+            left.addStretch(1)
+            self._update_map_button()
 
             # ============ MIDDLE: 3D view + live gesture + EMG
             g, lay = self._group("3D View")
@@ -6128,7 +6368,7 @@ if HAS_QT:
             elif not self.is_calibrated:
                 msg = "Step 3: click Calibrate. Relax your arm during REST, then squeeze steadily during FLEX."
             else:
-                msg = "Step 4: check the gesture mapping, then press ENABLE ARM CONTROL."
+                msg = "Step 4: check the gesture mapping (button in the left panel), then press ENABLE ARM CONTROL."
             if self.lbl_next.text() != msg:
                 self.lbl_next.setText(msg)
 
@@ -6368,6 +6608,16 @@ if HAS_QT:
                 combo.currentTextChanged.connect(lambda text, c=cls: self.bridge.set_action(c, text))
                 self.map_form.addRow(f"Gesture: {cls}", combo)
                 self.mapping_combos[cls] = combo
+            self._update_map_button()
+
+        def _toggle_mapping(self, on):
+            self.grp_map.setVisible(on)
+            self._update_map_button()
+
+        def _update_map_button(self):
+            n = len(self.mapping_combos)
+            what = f"{n} gestures" if n else "load a model first"
+            self.btn_map.setText(("Hide" if self.btn_map.isChecked() else "Show / edit") + f" gesture \u2192 arm action mapping  ({what})")
 
         def check_ready_state(self):
             if self.model_loaded:
@@ -6667,8 +6917,10 @@ if HAS_QT:
             if view.renderer is not None and view.isVisible():
                 self.lbl_fps.setText(f"{view.ms:.1f} ms")
             if self.fs is not None:
+                self.fs.update_count()
                 self.fs.lbl.setText(f"X {x:6.1f}  Y {y:6.1f}  Z {z:6.1f} mm   |   gripper {s.gripper_opening * 100:3.0f}%   |   "
-                                    + ("E-STOP" if s.estopped else f"safety {s.safety}") + "   |   " + self._key_hint_text())
+                                    + ("E-STOP" if s.estopped else f"safety {s.safety}")
+                                + ("   |   " + hint if (hint := self._key_hint_text()) and not hint.startswith("Keys:") else ""))
             self.lbl_keys.setText(self._key_hint_text())
             self.refresh_guidance()
 
@@ -6704,6 +6956,8 @@ if HAS_QT:
             return app.exec_()
         finally:
             rt.stop()
+
+
 
 
 
